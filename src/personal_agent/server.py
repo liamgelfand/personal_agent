@@ -77,12 +77,24 @@ def same_origin(origin: str | None, host: str | None) -> bool:
     return bool(host) and urlsplit(origin).netloc == host
 
 
+def host_allowed(host: str | None, remote_enabled: bool) -> bool:
+    """DNS-rebinding defense: a site that points its own name at 127.0.0.1 sends matching Origin and
+    Host headers, so local-only mode must also insist the Host is a loopback name. With remote
+    access on, every request needs the sign-in token instead."""
+    if remote_enabled:
+        return True
+    hostname = urlsplit(f"//{host or ''}").hostname
+    return hostname in LOOPBACK
+
+
 def signed_in(cookies: dict[str, str]) -> bool:
     return not config.remote.enabled or remote.valid(cookies.get(remote.COOKIE))
 
 
 @app.middleware("http")
 async def guard_requests(request: Request, call_next):
+    if not host_allowed(request.headers.get("host"), config.remote.enabled):
+        return JSONResponse({"detail": "unexpected host"}, status_code=403)
     if request.method != "GET" and not same_origin(request.headers.get("origin"), request.headers.get("host")):
         return JSONResponse({"detail": "forbidden origin"}, status_code=403)
     path = request.url.path
@@ -458,7 +470,9 @@ async def start_review(repo: str, task: str | None = None) -> dict:
 async def events(ws: WebSocket) -> None:
     """Client sends {type: chat|stop|approve, ...}; server pushes every event to every client."""
     # Browsers don't apply CORS to WebSockets, so any open tab could otherwise drive the agent.
-    if not same_origin(ws.headers.get("origin") or "missing", ws.headers.get("host")) or not signed_in(ws.cookies):
+    host = ws.headers.get("host")
+    if (not host_allowed(host, config.remote.enabled) or not same_origin(ws.headers.get("origin") or "missing", host)
+            or not signed_in(ws.cookies)):
         await ws.close(code=1008)
         return
     await ws.accept()
@@ -466,16 +480,20 @@ async def events(ws: WebSocket) -> None:
     await bus.connect(ws)
     try:
         while True:
-            msg = await ws.receive_json()
-            kind = msg.get("type")
-            if kind == "chat":
-                if not chats.start(msg["conversation_id"], msg["prompt"]):
-                    await ws.send_json({"type": "error", "conversation_id": msg["conversation_id"],
-                                        "message": "conversation is busy or missing"})
-            elif kind == "stop":
-                chats.stop(msg["conversation_id"])
-            elif kind == "approve":
-                bus.resolve(msg["id"], bool(msg["allow"]))
+            try:
+                msg = await ws.receive_json()
+                kind = msg.get("type")
+                if kind == "chat":
+                    if not chats.start(msg["conversation_id"], str(msg["prompt"])):
+                        await ws.send_json({"type": "error", "conversation_id": msg["conversation_id"],
+                                            "message": "conversation is busy, missing, or the message is empty"})
+                elif kind == "stop":
+                    chats.stop(msg["conversation_id"])
+                elif kind == "approve":
+                    bus.resolve(msg["id"], bool(msg["allow"]))
+            except (KeyError, TypeError, AttributeError, ValueError):
+                # A malformed message is answered, not fatal to the connection.
+                await ws.send_json({"type": "error", "message": "malformed message"})
     except WebSocketDisconnect:
         pass
     finally:

@@ -10,8 +10,8 @@ from . import gitops
 from .agents import load_agent
 from .bus import Bus
 from .config import Config
-from .guards import guard_hook
-from .runner import run_agent, summarize_tool
+from .guards import approval_detail, guard_hook
+from .runner import run_agent
 from .store import Store
 from .workspace import Workspace
 
@@ -62,7 +62,7 @@ async def review_workspace(ws: Workspace, config: Config, store: Store, bus: Bus
     scope = {"workspace": ws.key}
 
     async def approve(tool: str, args: dict[str, Any], reason: str) -> bool:
-        return await bus.request_approval(scope, tool, summarize_tool(tool, args), reason)
+        return await bus.request_approval(scope, tool, approval_detail(tool, args), reason)
 
     reviewer = load_agent("reviewer", config.models.reviewer)
     options = ClaudeAgentOptions(

@@ -18,9 +18,9 @@ from . import gitops
 from .agents import load_agent
 from .bus import Bus
 from .config import WORKTREES_DIR, Access, Config
-from .guards import guard_hook
+from .guards import approval_detail, guard_hook
 from .review import has_open_findings, review_workspace
-from .runner import run_agent, summarize_tool
+from .runner import run_agent
 from .store import Store
 from .workspace import get_workspace
 
@@ -45,6 +45,7 @@ class TaskManager:
     def __init__(self, config: Config, store: Store, bus: Bus):
         self.config, self.store, self.bus = config, store, bus
         self.running: dict[str, asyncio.Task] = {}
+        self.discarding: set[str] = set()
 
     def recover(self) -> None:
         """Tasks that were mid-run when the server stopped can't be resumed; mark them stopped."""
@@ -89,7 +90,12 @@ class TaskManager:
         return False
 
     async def discard(self, task_id: str) -> None:
-        self.stop(task_id)
+        # Wait for a running pipeline to actually end (and its Claude Code process to exit) before
+        # deleting the worktree it is working in; on Windows the folder is locked until then.
+        if job := self.running.get(task_id):
+            self.discarding.add(task_id)
+            job.cancel()
+            await asyncio.wait({job}, timeout=30)
         task = self.store.task(task_id)
         repo = self.config.repo(task["repo"])
         await gitops.remove_worktree(repo.path, Path(task["worktree"]), task["branch"])
@@ -149,7 +155,7 @@ class TaskManager:
         scope = {"task_id": ws.task_id}
 
         async def approve(tool: str, args: dict[str, Any], reason: str) -> bool:
-            return await self.bus.request_approval(scope, tool, summarize_tool(tool, args), reason)
+            return await self.bus.request_approval(scope, tool, approval_detail(tool, args), reason)
 
         implementer = load_agent("implementer", self.config.models.implementer)
         return ClaudeAgentOptions(
@@ -201,9 +207,11 @@ class TaskManager:
                 )
             await self._publish_task(task_id, status="ready")
         except asyncio.CancelledError:
-            await self._publish_task(task_id, status="stopped")
+            if task_id not in self.discarding:  # a discard sets the final status itself
+                await self._publish_task(task_id, status="stopped")
         except Exception as exc:
             await self._emit(task_id, {"type": "error", "message": f"{type(exc).__name__}: {exc}"})
             await self._publish_task(task_id, status="failed", error=str(exc))
         finally:
             self.running.pop(task_id, None)
+            self.discarding.discard(task_id)

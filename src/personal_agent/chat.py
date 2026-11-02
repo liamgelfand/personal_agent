@@ -15,8 +15,8 @@ from .agents import (
 from .bus import Bus
 from .checkpoints import Checkpoint, Checkpoints
 from .config import SCRATCH_DIR, Access, Config, Repo
-from .guards import guard_hook
-from .runner import run_agent, summarize_tool
+from .guards import approval_detail, guard_hook
+from .runner import run_agent
 from .store import Store
 from .tasks import TaskManager
 
@@ -54,7 +54,10 @@ def attach_mentions(prompt: str, root: Path | None) -> str:
         if rel in seen or (root not in path.parents) or not path.is_file():
             continue
         seen.add(rel)
-        data = path.read_bytes()
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue  # locked or unreadable: the agent can still try the Read tool
         if b"\0" in data[:8000]:
             continue  # binary
         if len(data) > MENTION_FILE_LIMIT or total + len(data) > MENTION_TOTAL_LIMIT:
@@ -78,7 +81,7 @@ class ChatManager:
         return list(self.running)
 
     def start(self, conv_id: str, prompt: str) -> bool:
-        if conv_id in self.running or not self.store.conversation(conv_id):
+        if not prompt.strip() or conv_id in self.running or not self.store.conversation(conv_id):
             return False
         self.running[conv_id] = asyncio.create_task(self._turn(conv_id, prompt))
         return True
@@ -133,7 +136,7 @@ class ChatManager:
 
         async def approve(tool_name: str, args: dict[str, Any], reason: str) -> bool:
             return await self.bus.request_approval(
-                {"conversation_id": conv_id}, tool_name, summarize_tool(tool_name, args), reason
+                {"conversation_id": conv_id}, tool_name, approval_detail(tool_name, args), reason
             )
 
         common = dict(
@@ -175,21 +178,24 @@ class ChatManager:
         )
 
     async def _turn(self, conv_id: str, prompt: str) -> None:
-        conv = self.store.conversation(conv_id)
-        history = self.store.events(conversation_id=conv_id)
-        await self._emit(conv_id, {"type": "user", "text": prompt})
-        await self.bus.publish({"type": "chat_status", "conversation_id": conv_id, "busy": True})
-        if conv["title"] == DEFAULT_TITLE:
-            first_line = prompt.strip().splitlines()[0][:60]
-            conv = self.store.update_conversation(conv_id, title=first_line or DEFAULT_TITLE)
-            await self.bus.publish({"type": "conversation_updated", "conversation": conv})
-
-        agent_prompt = attach_mentions(prompt, self._cwd(conv) if conv["repo"] else None)
-        if not conv["session_id"] and history:
-            agent_prompt = f"Earlier in this conversation:\n\n{_recap(history)}\n\n---\n\nNew message:\n{agent_prompt}"
-        # Agent mode records the original of every file it edits, so the turn can be undone.
-        checkpoint = Checkpoint(self._cwd(conv)) if conv["mode"] == "agent" else None
+        # Everything runs inside the try, so a failure or Stop at any point still clears "busy".
+        history: list[dict[str, Any]] = []
+        checkpoint: Checkpoint | None = None
         try:
+            conv = self.store.conversation(conv_id)
+            history = self.store.events(conversation_id=conv_id)
+            await self._emit(conv_id, {"type": "user", "text": prompt})
+            await self.bus.publish({"type": "chat_status", "conversation_id": conv_id, "busy": True})
+            if conv["title"] == DEFAULT_TITLE:
+                first_line = prompt.strip().splitlines()[0][:60]
+                conv = self.store.update_conversation(conv_id, title=first_line or DEFAULT_TITLE)
+                await self.bus.publish({"type": "conversation_updated", "conversation": conv})
+
+            agent_prompt = attach_mentions(prompt, self._cwd(conv) if conv["repo"] else None)
+            if not conv["session_id"] and history:
+                agent_prompt = f"Earlier in this conversation:\n\n{_recap(history)}\n\n---\n\nNew message:\n{agent_prompt}"
+            # Agent mode records the original of every file it edits, so the turn can be undone.
+            checkpoint = Checkpoint(self._cwd(conv)) if conv["mode"] == "agent" else None
             options = self._options(conv, checkpoint)
             async for event in run_agent(options, agent_prompt, self.store, self.bus, "chat", conv_id):
                 if event["type"] == "delta":

@@ -44,6 +44,7 @@ type State = {
   undone: Record<string, boolean>
 
   init: () => Promise<void>
+  resync: () => Promise<void>
   setWorkspace: (ws: WorkspaceRef) => void
   openConversation: (id: string) => Promise<void>
   newConversation: (repo: string | null, mode?: Mode) => Promise<void>
@@ -90,6 +91,14 @@ export const useApp = create<State>((set, get) => ({
     const busyConvs = Object.fromEntries(conversations.filter((c) => c.busy).map((c) => [c.id, true]))
     set({ repos, conversations, tasks, busyConvs, workspace: repos[0] ? { repo: repos[0].name, task: null } : null })
     if (conversations[0]) await get().openConversation(conversations[0].id)
+  },
+
+  async resync() {
+    const [conversations, tasks] = await Promise.all([api.conversations(), api.tasks()])
+    const busyConvs = Object.fromEntries(conversations.map((c) => [c.id, !!c.busy]))
+    set({ conversations, tasks, busyConvs })
+    const active = get().activeConv
+    if (active && conversations.some((c) => c.id === active)) await get().openConversation(active)
   },
 
   setWorkspace(ws) {

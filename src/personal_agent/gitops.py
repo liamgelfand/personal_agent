@@ -40,10 +40,13 @@ async def status(root: Path) -> dict[str, Any]:
         if len(entry) < 4:
             continue
         x, y, path = entry[0], entry[1], entry[3:]
+        orig = None
         if x in "RC":
-            i += 1  # skip the rename source
+            orig = entries[i] if i < len(entries) else None  # with -z the source path follows
+            i += 1
         files.append({
             "path": path,
+            "orig": orig,
             "index": x,
             "worktree": y,
             "untracked": x == "?",
@@ -95,19 +98,36 @@ async def unstage(root: Path, paths: list[str]) -> None:
         await git(root, "rm", "--cached", "-r", "--quiet", "--", *paths)
 
 
+def _remove_new_file(root: Path, rel: str) -> None:
+    """Delete a file that is new in the working tree. A symlink is removed itself, never its target."""
+    target = root / rel
+    if root.resolve() in target.parent.resolve().parents or target.parent.resolve() == root.resolve():
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+
+
 async def discard(root: Path, paths: list[str]) -> None:
-    """Throw away changes: restore tracked files from HEAD, delete untracked ones."""
+    """Throw away changes: restore tracked files from HEAD, delete untracked or added ones."""
     st = {f["path"]: f for f in (await status(root))["files"]}
-    tracked = [p for p in paths if p in st and not st[p]["untracked"] and st[p]["index"] != "A"]
-    if tracked:
-        await git(root, "restore", "--staged", "--worktree", "--source=HEAD", "--", *tracked)
+    restore: list[str] = []
+    remove: list[str] = []
     for p in paths:
         entry = st.get(p)
-        if entry and (entry["untracked"] or entry["index"] == "A"):
-            await git(root, "rm", "--cached", "--quiet", "--ignore-unmatch", "--", p, check=False)
-            target = (root / p).resolve()
-            if root.resolve() in target.parents and target.is_file():
-                target.unlink()
+        if not entry:
+            continue
+        if entry["index"] == "R" and entry["orig"]:
+            restore.append(entry["orig"])  # bring back the old name, drop the new one
+            remove.append(p)
+        elif entry["untracked"] or entry["index"] in "AC":
+            remove.append(p)
+        else:
+            restore.append(p)
+    for p in remove:
+        # --force: git otherwise refuses when the staged copy differs from both HEAD and the file.
+        await git(root, "rm", "--cached", "--force", "--quiet", "--ignore-unmatch", "--", p)
+        _remove_new_file(root, p)
+    if restore:
+        await git(root, "restore", "--staged", "--worktree", "--source=HEAD", "--", *restore)
 
 
 async def commit(root: Path, message: str) -> str:

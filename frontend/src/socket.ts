@@ -84,7 +84,10 @@ function handle(e: ServerEvent) {
         location.reload()
         return
       }
-      set({ admin, restarting: false })
+      // Events may have been missed while disconnected (e.g. a phone asleep). Pending approvals are
+      // re-sent right after this message, so start that list fresh and re-fetch everything else.
+      set({ admin, restarting: false, approvals: [], streaming: {} })
+      if (s.admin) s.resync().catch(() => {})
       return
     }
     case 'admin_status':

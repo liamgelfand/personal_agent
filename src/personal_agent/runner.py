@@ -9,6 +9,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     RateLimitEvent,
+    ResultError,
     ResultMessage,
     StreamEvent,
     TextBlock,
@@ -20,6 +21,23 @@ from .bus import Bus
 from .store import Store
 
 SUMMARY_KEYS = ("command", "file_path", "path", "pattern", "query", "url", "description", "title")
+
+
+async def _messages(prompt: str, options: ClaudeAgentOptions) -> AsyncIterator[Any]:
+    """SDK messages, ending quietly after an error result.
+
+    When Claude Code ends with an error result (turn limit, usage limit, API error) the SDK yields
+    the ResultMessage and then raises ResultError. The result already carries the details.
+    """
+    got_error_result = False
+    try:
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, ResultMessage) and message.is_error:
+                got_error_result = True
+            yield message
+    except ResultError:
+        if not got_error_result:
+            raise
 
 
 def summarize_tool(name: str, args: dict[str, Any]) -> str:
@@ -36,7 +54,7 @@ async def run_agent(
     run_id = store.start_run(kind, ref)
     result: ResultMessage | None = None
     try:
-        async for message in query(prompt=prompt, options=options):
+        async for message in _messages(prompt, options):
             if isinstance(message, StreamEvent):
                 event = message.event
                 delta = event.get("delta", {})

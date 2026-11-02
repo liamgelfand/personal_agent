@@ -158,3 +158,35 @@ def test_classify_self_changes():
     assert classify(PROJECT_ROOT / "frontend" / "src" / "App.tsx") == "ui"
     assert classify(PROJECT_ROOT / "agents" / "reviewer.md") is None  # read on every run, no restart
     assert classify(PROJECT_ROOT / "README.md") is None
+
+
+def test_host_allowed_blocks_dns_rebinding():
+    from personal_agent.server import host_allowed
+
+    for host in ("127.0.0.1:8000", "localhost:8000", "[::1]:8000", "localhost:5173"):
+        assert host_allowed(host, remote_enabled=False), host
+    for host in ("evil.example:8000", "100.64.0.5:8000", None, ""):
+        assert not host_allowed(host, remote_enabled=False), host
+    assert host_allowed("100.64.0.5:8000", remote_enabled=True)  # remote mode relies on the sign-in token
+
+
+async def test_discard_renamed_file_restores_original(repo):
+    sh(repo, "git", "mv", "app.py", "main.py")
+    (repo / "main.py").write_text("changed\n", newline="")
+    await gitops.discard(repo, ["main.py"])
+    assert (repo / "app.py").read_text() == "def hello():\n    return 'Hello'\n"
+    assert not (repo / "main.py").exists()
+    assert (await gitops.status(repo))["files"] == []
+
+
+async def test_discard_untracked_symlink_keeps_target(repo):
+    import os
+
+    try:
+        os.symlink(repo / "app.py", repo / "link.py")
+    except OSError:
+        pytest.skip("symlinks need extra privileges on this system")
+    (repo / "app.py").write_text("uncommitted edit\n", newline="")
+    await gitops.discard(repo, ["link.py"])
+    assert not (repo / "link.py").is_symlink()
+    assert (repo / "app.py").read_text() == "uncommitted edit\n"
