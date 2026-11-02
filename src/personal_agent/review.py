@@ -71,7 +71,7 @@ async def review_workspace(ws: Workspace, config: Config, store: Store, bus: Bus
         model=config.models.reviewer,
         tools=READ_TOOLS,
         allowed_tools=READ_TOOLS,
-        hooks={"PreToolUse": [guard_hook([ws.as_root()], ws.path, approve)]},
+        hooks={"PreToolUse": [guard_hook([ws.as_root()], ws.path, approve, config.auto_approve)]},
         setting_sources=["project"],
         output_format={"type": "json_schema", "schema": REVIEW_SCHEMA},
         max_turns=40,

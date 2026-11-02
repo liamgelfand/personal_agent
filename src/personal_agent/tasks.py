@@ -164,7 +164,7 @@ class TaskManager:
             model=self.config.models.implementer,
             allowed_tools=IMPLEMENTER_TOOLS,
             disallowed_tools=["PowerShell", "Agent", "Task", "WebSearch", "WebFetch"],
-            hooks={"PreToolUse": [guard_hook([ws.as_root()], ws.path, approve)]},
+            hooks={"PreToolUse": [guard_hook([ws.as_root()], ws.path, approve, self.config.auto_approve)]},
             setting_sources=["project"],
             max_turns=self.config.max_turns,
             resume=session_id,
