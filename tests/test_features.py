@@ -1,5 +1,6 @@
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -200,3 +201,43 @@ async def test_restored_checkpoints_are_reported(tmp_path, repo):
     assert cps.restored_ids([saved["id"]]) == set()
     cps.restore(saved["id"], [repo.resolve()])
     assert cps.restored_ids([saved["id"], "other"]) == {saved["id"]}
+
+
+# links open in the default browser
+
+def test_open_url_accepts_web_links_only(monkeypatch):
+    from fastapi import HTTPException
+
+    from personal_agent import server
+
+    local, phone = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")), SimpleNamespace(client=SimpleNamespace(host="100.64.0.5"))
+    opened = []
+    monkeypatch.setattr(server.launcher, "open_app", lambda url, tab=False: opened.append((url, tab)))
+    assert server.open_url(server.OpenUrl(url="https://example.com/a?b=1"), local) == {"ok": True}
+    assert server.open_url(server.OpenUrl(url="HTTP://example.com"), local)
+    for url in ("javascript:alert(1)", "file:///C:/Windows/win.ini", "ms-settings:", "http:no-host", "/relative", ""):
+        with pytest.raises(HTTPException) as exc:
+            server.open_url(server.OpenUrl(url=url), local)
+        assert exc.value.status_code == 400, url
+    with pytest.raises(HTTPException) as exc:  # a phone must not open tabs on this computer
+        server.open_url(server.OpenUrl(url="https://example.com"), phone)
+    assert exc.value.status_code == 403
+    assert opened == [("https://example.com/a?b=1", True), ("HTTP://example.com", True)]
+
+
+def test_open_url_rejects_cross_origin_posts(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from personal_agent import server
+
+    opened = []
+    monkeypatch.setattr(server.launcher, "open_app", lambda url, tab=False: opened.append(url))
+    client = TestClient(server.app, client=("127.0.0.1", 50000))
+    host = "127.0.0.1:8000"  # an allowed host, so only the Origin decides
+    response = client.post("/api/open-url", json={"url": "https://example.com"},
+                           headers={"Host": host, "Origin": "https://evil.example"})
+    assert response.status_code == 403 and response.json()["detail"] == "forbidden origin"
+    assert opened == []
+    response = client.post("/api/open-url", json={"url": "https://example.com"},
+                           headers={"Host": host, "Origin": f"http://{host}"})
+    assert response.status_code == 200 and opened == ["https://example.com"]
