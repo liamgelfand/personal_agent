@@ -263,11 +263,11 @@ class ChatManager:
                 tools=CHAT_TOOLS,
                 allowed_tools=CHAT_TOOLS,
                 disallowed_tools=CHAT_BLOCKED,
-                hooks={"PreToolUse": [guard_hook(read_only_roots, cwd, approve)]},
+                hooks={"PreToolUse": [guard_hook(read_only_roots, cwd, approve, self.config.auto_approve)]},
             )
 
         can_start_tasks = repo is not None and repo.access is Access.WRITE
-        hooks = {"PreToolUse": [guard_hook(roots, cwd, approve)]}
+        hooks = {"PreToolUse": [guard_hook(roots, cwd, approve, self.config.auto_approve)]}
         if checkpoint:
             for event, matchers in checkpoint.hooks().items():
                 hooks.setdefault(event, []).extend(matchers)

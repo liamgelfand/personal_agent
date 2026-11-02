@@ -28,10 +28,15 @@ BLOCKED_COMMANDS = [
     (re.compile(r"\bgit\s+clean\s+-\w*f"), "git clean -f"),
     (re.compile(r"\brm\s+-\w*r\w*\s+(/|~|\$HOME|[A-Za-z]:[\\/])\s*$"), "recursive delete of a root"),
     (re.compile(r"\bgh\s+repo\s+delete\b"), "deleting a GitHub repo"),
-    (re.compile(r"\bgh\s+pr\s+merge\b"), "merging a PR (you merge, not the agent)"),
 ]
 
-# Allowed only after the user approves in the UI.
+# Merging always needs the user, even with auto_approve (the API route skips `gh pr merge`).
+MERGE_COMMANDS = [
+    (re.compile(r"\bgh\s+pr\s+merge\b"), "merge a PR"),
+    (re.compile(r"\bgh\s+api\b.*/pulls/\d+/merge\b"), "merge a PR"),
+]
+
+# Allowed only after the user approves in the UI (or automatically with auto_approve).
 ASK_COMMANDS = [
     (re.compile(r"\bgit\s+push\b"), "push to a remote"),
     (re.compile(r"\bgit\s+commit\b"), "create a commit"),
@@ -81,6 +86,7 @@ SEGMENT_SPLIT = re.compile(r"&&|\|\||[;|&\n]")
 class Decision:
     action: Literal["deny", "ask"]
     reason: str
+    always_ask: bool = False  # asks even when auto_approve is on
 
 
 def normalize_command(command: str) -> str:
@@ -175,6 +181,9 @@ def check_tool_use(
         # Wildcards or variables could name a protected file without spelling it out.
         if writes and targets_self and (names_protected or SHELL_WILDCARDS.search(command)):
             return Decision("ask", "run a command that may modify the agent's own config or guard")
+        for pattern, label in MERGE_COMMANDS:
+            if pattern.search(command):
+                return Decision("ask", label, always_ask=True)
         for pattern, label in ASK_COMMANDS:
             if pattern.search(command):
                 return Decision("ask", label)
@@ -217,13 +226,15 @@ def _decision(kind: str, reason: str) -> dict[str, Any]:
     }
 
 
-def guard_hook(roots: list[Repo], cwd: Path, approve: Approver) -> HookMatcher:
+def guard_hook(roots: list[Repo], cwd: Path, approve: Approver, auto_approve: bool = False) -> HookMatcher:
     async def hook(input_data: dict[str, Any], tool_use_id: str | None, context: HookContext):
         tool, args = input_data["tool_name"], input_data["tool_input"]
         decision = check_tool_use(tool, args, roots, cwd)
         if decision is None:
             return {}
         if decision.action == "ask":
+            if auto_approve and not decision.always_ask:
+                return _decision("allow", f"auto-approved: {decision.reason}")
             if await approve(tool, args, decision.reason):
                 return _decision("allow", f"user approved: {decision.reason}")
             return _decision("deny", f"user declined: {decision.reason}")
