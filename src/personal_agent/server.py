@@ -424,7 +424,8 @@ class FileWrite(BaseModel):
 @app.get("/api/fs/tree")
 async def tree(repo: str, task: str | None = None) -> dict:
     ws = get_workspace(config, store, repo, task)
-    return {"root": str(ws.path), "access": ws.access.value, "files": await list_files(ws)}
+    files, truncated = await list_files(ws)
+    return {"root": str(ws.path), "access": ws.access.value, "files": files, "truncated": truncated}
 
 
 @app.get("/api/fs/file")

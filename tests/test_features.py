@@ -96,6 +96,38 @@ async def test_search_finds_matches_with_line_numbers(repo):
     assert (await search(ws, "h.llo\\(", regex=True))["matches"][0]["line"] == 1
 
 
+async def test_search_includes_ignored_files_but_skips_heavy_dirs(repo):
+    (repo / ".gitignore").write_text("config.yaml\n", newline="")
+    (repo / "config.yaml").write_text("needle: 1\n", newline="")
+    (repo / "node_modules").mkdir()
+    (repo / "node_modules" / "lib.js").write_text("needle\n", newline="")
+    ws = Workspace(Repo(name="r", path=repo, access=Access.WRITE), None, repo.resolve(), Access.WRITE)
+    assert [m["path"] for m in (await search(ws, "needle"))["matches"]] == ["config.yaml"]
+    # One regex engine for tracked and ignored files alike.
+    assert {m["path"] for m in (await search(ws, r"\d|(?=d)", regex=True))["matches"]} == {"app.py", "config.yaml"}
+
+
+async def test_search_rejects_bad_regex(repo):
+    ws = Workspace(Repo(name="r", path=repo, access=Access.WRITE), None, repo.resolve(), Access.WRITE)
+    with pytest.raises(ValueError):
+        await search(ws, "foo(", regex=True)
+
+
+async def test_search_skips_symlinks_outside_workspace(repo, tmp_path):
+    import re
+
+    from personal_agent.workspace import _search
+
+    (tmp_path / "secret.txt").write_text("PRIVATE KEY\n", newline="")
+    assert _search(repo, ["../secret.txt"], re.compile("PRIVATE"), True) == []  # same check, no symlink needed
+    try:
+        (repo / "leak").symlink_to(tmp_path / "secret.txt")
+    except OSError:
+        pytest.skip("symlinks not permitted")
+    ws = Workspace(Repo(name="r", path=repo, access=Access.WRITE), None, repo.resolve(), Access.WRITE)
+    assert (await search(ws, "PRIVATE KEY"))["matches"] == []
+
+
 # merge
 
 async def test_merge_task_branch(tmp_path, repo):

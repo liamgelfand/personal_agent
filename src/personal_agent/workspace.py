@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import gitops
-from .config import Access, Config, Repo
+from .config import DATA_DIR, WORKTREES_DIR, Access, Config, Repo
 from .store import Store
 
 MAX_FILE_BYTES = 2_000_000
-WALK_EXCLUDES = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next"}
+MAX_LIST_FILES = 50_000
+# Heavy or generated directories skipped when walking (files git tracks in them are still listed).
+WALK_EXCLUDES = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".idea", ".vscode-test",
+}
+# This app's own task worktrees and checkpoint copies, so they don't appear inside its tree.
+EXCLUDED_DIRS = {WORKTREES_DIR.resolve(), (DATA_DIR / "checkpoints").resolve()}
 
 
 class WorkspaceError(Exception):
@@ -58,54 +67,99 @@ def get_workspace(config: Config, store: Store, repo: str, task: str | None = No
     return Workspace(repo_cfg, task, Path(row["worktree"]), Access.WRITE)
 
 
-async def list_files(ws: Workspace) -> list[str]:
-    """All non-ignored files, as POSIX paths relative to the workspace."""
-    if await gitops.is_repo(ws.path):
-        out = await gitops.git(ws.path, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
-        files = {p for p in out.split("\0") if p}
-        return sorted(p for p in files if (ws.path / p).is_file())
-    files = []
-    for dirpath, dirnames, filenames in os.walk(ws.path):
-        dirnames[:] = [d for d in dirnames if d not in WALK_EXCLUDES]
-        rel = Path(dirpath).relative_to(ws.path)
-        files += [(rel / f).as_posix() for f in filenames]
-    return sorted(files)
+async def list_files(ws: Workspace) -> tuple[list[str], bool]:
+    """Every file on disk, git-ignored ones too, as sorted POSIX paths relative to the workspace,
+    plus whether the list was cut at MAX_LIST_FILES. Files git doesn't ignore are always kept;
+    ignored files fill the remaining budget. WALK_EXCLUDES dirs are walked past but tracked files in them stay."""
+    visible, ignored, truncated = await _listing(ws.path)
+    return sorted(visible + ignored), truncated
+
+
+async def _listing(root: Path) -> tuple[list[str], list[str], bool]:
+    """(files git doesn't ignore, other files found on disk, whether the list was cut), each sorted."""
+    visible = await _git_visible_files(root)
+    if len(visible) > MAX_LIST_FILES:
+        return visible[:MAX_LIST_FILES], [], True
+    ignored, truncated = await asyncio.to_thread(_walk, root, set(visible), MAX_LIST_FILES - len(visible))
+    return visible, ignored, truncated
+
+
+async def _git_visible_files(root: Path) -> list[str]:
+    """Tracked files plus untracked-but-not-ignored ones outside WALK_EXCLUDES dirs, existing on disk.
+    Empty outside a git repo."""
+    if not await gitops.is_repo(root):
+        return []
+    tracked = await gitops.git(root, "ls-files", "-z", "--cached")
+    untracked = await gitops.git(root, "ls-files", "-z", "--others", "--exclude-standard")
+    files = {p for p in tracked.split("\0") if p}
+    files |= {p for p in untracked.split("\0") if p and not WALK_EXCLUDES.intersection(p.split("/")[:-1])}
+    return sorted(p for p in files if (root / p).is_file())
+
+
+def _walk(root: Path, known: set[str], budget: int) -> tuple[list[str], bool]:
+    """Files under root not in `known`, up to `budget`, in sorted order (so a cut is deterministic).
+    Skips excluded and symlinked dirs and `.git` link files (worktrees, submodules)."""
+    excluded_names = {d.name for d in EXCLUDED_DIRS}
+    files: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):  # does not follow symlinked directories
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in WALK_EXCLUDES
+            and not (d in excluded_names and (Path(dirpath) / d).resolve() in EXCLUDED_DIRS)
+        )
+        rel = Path(dirpath).relative_to(root)
+        for f in sorted(filenames):
+            p = (rel / f).as_posix()
+            if f == ".git" or p in known:
+                continue
+            files.append(p)
+            if len(files) > budget:
+                return files[:budget], True
+    return files, False
 
 
 SEARCH_LIMIT = 500
 
 
 async def search(ws: Workspace, query: str, regex: bool = False, case: bool = False) -> dict:
-    """Text search across the workspace's non-ignored files. Returns up to SEARCH_LIMIT matches."""
+    """Text search (Python regex syntax) across every listed file, git-ignored ones too.
+    Returns up to SEARCH_LIMIT matches, files git doesn't ignore first. Raises ValueError for a bad regex."""
     if not query:
         return {"matches": [], "truncated": False}
-    if await gitops.is_repo(ws.path):
-        args = ["grep", "-n", "-I", "-z", "--untracked", "--full-name", "-E" if regex else "-F"]
-        if not case:
-            args.append("-i")
-        out = await gitops.git(ws.path, *args, "-e", query, check=False)
-        matches = []
-        for line in out.splitlines():
-            parts = line.split("\0", 2)  # path NUL line NUL text
-            if len(parts) == 3 and parts[1].isdigit():
-                matches.append({"path": parts[0], "line": int(parts[1]), "text": parts[2][:300]})
-                if len(matches) > SEARCH_LIMIT:
-                    break
-        return {"matches": matches[:SEARCH_LIMIT], "truncated": len(matches) > SEARCH_LIMIT}
-    import re
+    try:
+        pattern = re.compile(query if regex else re.escape(query), 0 if case else re.IGNORECASE)
+    except re.error as exc:
+        raise ValueError(str(exc)) from exc
+    visible, ignored, truncated = await _listing(ws.path)
+    matches = await asyncio.to_thread(_search, ws.path, visible + ignored, pattern, not regex)
+    return {"matches": matches[:SEARCH_LIMIT], "truncated": truncated or len(matches) > SEARCH_LIMIT}
 
-    pattern = re.compile(query if regex else re.escape(query), 0 if case else re.IGNORECASE)
+
+def _search(root: Path, files: list[str], pattern: re.Pattern, literal: bool) -> list[dict]:
+    """Up to SEARCH_LIMIT + 1 matches; skips binary, large, and files that resolve outside root (symlinks)."""
+    root = root.resolve()
     matches = []
-    for rel in await list_files(ws):
-        path = ws.path / rel
-        if path.stat().st_size > MAX_FILE_BYTES:
+    for rel in files:
+        try:
+            path = (root / rel).resolve()
+            if root not in path.parents or not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
+                continue
+            with path.open("rb") as fh:
+                head = fh.read(8000)
+                if b"\0" in head:  # binary: don't read the rest
+                    continue
+                data = head + fh.read()
+        except OSError:
             continue
-        for n, text in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
-            if pattern.search(text):
-                matches.append({"path": rel, "line": n, "text": text[:300]})
+        text = data.decode("utf-8", errors="ignore")
+        if literal and not pattern.search(text):  # a literal can't span lines, so this skip is exact
+            continue
+        for n, line in enumerate(text.splitlines(), 1):
+            if pattern.search(line):
+                matches.append({"path": rel, "line": n, "text": line[:300]})
                 if len(matches) > SEARCH_LIMIT:
-                    return {"matches": matches[:SEARCH_LIMIT], "truncated": True}
-    return {"matches": matches, "truncated": False}
+                    return matches
+    return matches
 
 
 def read_file(ws: Workspace, rel: str) -> dict:
@@ -124,6 +178,8 @@ def read_file(ws: Workspace, rel: str) -> dict:
 def write_file(ws: Workspace, rel: str, content: str) -> None:
     ws.require_write()
     path = ws.resolve(rel)
+    if ".git" in path.relative_to(ws.path).parts:  # a worktree's .git link file or git internals
+        raise WorkspaceError(f"{rel} is git metadata")
     path.parent.mkdir(parents=True, exist_ok=True)
     # Keep the file's existing line endings so saving doesn't rewrite every line.
     if path.is_file() and b"\r\n" in path.read_bytes()[:8000]:
