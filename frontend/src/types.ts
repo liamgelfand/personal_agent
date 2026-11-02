@@ -62,7 +62,7 @@ export type AgentEvent =
   | { type: 'review'; agent: string; review: Review }
   | { type: 'error'; message: string }
   | { type: 'stopped' }
-  | { type: 'checkpoint'; id: string; files: string[] }
+  | { type: 'checkpoint'; id: string; files: string[]; restored?: boolean }
 
 export type FileStatus = {
   path: string

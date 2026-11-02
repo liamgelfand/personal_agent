@@ -190,3 +190,13 @@ async def test_discard_untracked_symlink_keeps_target(repo):
     await gitops.discard(repo, ["link.py"])
     assert not (repo / "link.py").is_symlink()
     assert (repo / "app.py").read_text() == "uncommitted edit\n"
+
+
+async def test_restored_checkpoints_are_reported(tmp_path, repo):
+    cps = Checkpoints(Store(tmp_path / "t.db"))
+    cp = Checkpoint(repo)
+    await run_edit(cp, "1", repo / "app.py", "changed\n")
+    saved = cps.save(cp, "conv")
+    assert cps.restored_ids([saved["id"]]) == set()
+    cps.restore(saved["id"], [repo.resolve()])
+    assert cps.restored_ids([saved["id"], "other"]) == {saved["id"]}

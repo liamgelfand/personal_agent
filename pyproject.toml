@@ -15,6 +15,10 @@ dependencies = [
 [project.scripts]
 personal-agent = "personal_agent:main"
 
+# A windowless launcher (no console) for desktop shortcuts; see personal_agent/launcher.py.
+[project.gui-scripts]
+personal-agent-app = "personal_agent.launcher:main"
+
 [build-system]
 requires = ["uv_build>=0.13.6,<0.14.0"]
 build-backend = "uv_build"

@@ -55,8 +55,8 @@ function ToolRow({ event }: { event: ToolEvent }) {
 }
 
 // After an agent turn that edited files: what changed, with a one-click undo.
-function CheckpointRow({ id, files }: { id: string; files: string[] }) {
-  const undone = useApp((s) => !!s.undone[id])
+function CheckpointRow({ id, files, restored }: { id: string; files: string[]; restored: boolean }) {
+  const undone = useApp((s) => restored || !!s.undone[id])
   const showError = useApp((s) => s.showError)
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -163,7 +163,7 @@ export function EventView({ event }: { event: AgentEvent }) {
         </div>
       )
     case 'checkpoint':
-      return <CheckpointRow id={event.id} files={event.files} />
+      return <CheckpointRow id={event.id} files={event.files} restored={!!event.restored} />
     case 'stopped':
       return (
         <div className="meta-line">
