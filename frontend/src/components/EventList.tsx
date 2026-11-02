@@ -11,6 +11,7 @@ import { beforeUserMessage } from '../socket'
 import { tabId, useApp } from '../store'
 import type { AgentEvent } from '../types'
 import { FindingRow } from './ChangesPanel'
+import { markdownComponents } from './ExternalLink'
 
 type ToolEvent = Extract<AgentEvent, { type: 'tool' }>
 
@@ -199,7 +200,7 @@ export function EventView({ event, edit }: { event: AgentEvent; edit?: { convId:
         <div className={event.agent === 'main' ? '' : 'msg-sub'}>
           {event.agent !== 'main' && <div className="agent-label">{AGENT_NAMES[event.agent] ?? event.agent}</div>}
           <div className="msg-text">
-            <Markdown remarkPlugins={[remarkGfm]}>{event.text}</Markdown>
+            <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{event.text}</Markdown>
           </div>
         </div>
       )

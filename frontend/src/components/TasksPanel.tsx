@@ -2,6 +2,7 @@ import { ExternalLink, GitBranch, GitMerge } from 'lucide-react'
 import { api } from '../api'
 import { tabId, useApp } from '../store'
 import type { Task, TaskStatus } from '../types'
+import { openExternal } from './ExternalLink'
 
 export const ACTIVE_STATUSES = new Set<TaskStatus>(['queued', 'implementing', 'reviewing', 'fixing'])
 
@@ -99,7 +100,13 @@ export function TasksPanel({ repo }: { repo: string }) {
                 </button>
               )}
               {t.pr_url && (
-                <a className="btn sm" href={t.pr_url} target="_blank" rel="noreferrer">
+                <a
+                  className="btn sm"
+                  href={t.pr_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={(e) => openExternal(e, t.pr_url!)}
+                >
                   Pull request <ExternalLink size={12} />
                 </a>
               )}
