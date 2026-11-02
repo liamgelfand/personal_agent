@@ -61,6 +61,7 @@ export type AgentEvent =
   | { type: 'task_link'; task_id: string; title: string }
   | { type: 'review'; agent: string; review: Review }
   | { type: 'error'; message: string }
+  | { type: 'warning'; message: string }
   | { type: 'stopped' }
   | { type: 'checkpoint'; id: string; files: string[]; restored?: boolean }
 

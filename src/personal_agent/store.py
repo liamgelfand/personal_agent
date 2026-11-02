@@ -127,9 +127,9 @@ class Store:
 
     # events
 
-    def add_event(self, payload: dict[str, Any], conversation_id: str | None = None, task_id: str | None = None) -> None:
+    def add_event(self, payload: dict[str, Any], conversation_id: str | None = None, task_id: str | None = None) -> int:
         with self.db:
-            self.db.execute(
+            cur = self.db.execute(
                 "INSERT INTO events (conversation_id, task_id, ts, payload) VALUES (?, ?, ?, ?)",
                 (conversation_id, task_id, time.time(), json.dumps(payload)),
             )
@@ -137,6 +137,23 @@ class Store:
                 self.db.execute(
                     "UPDATE conversations SET updated_at = ? WHERE id = ?", (time.time(), conversation_id)
                 )
+        return cur.lastrowid
+
+    def update_event(self, event_id: int, payload: dict[str, Any]) -> None:
+        with self.db:
+            self.db.execute("UPDATE events SET payload = ? WHERE id = ?", (json.dumps(payload), event_id))
+
+    def event_rows(self, conversation_id: str) -> list[tuple[int, dict[str, Any]]]:
+        """A conversation's events with their row ids, oldest first."""
+        rows = self.db.execute(
+            "SELECT id, payload FROM events WHERE conversation_id = ? ORDER BY id", (conversation_id,)
+        )
+        return [(r["id"], json.loads(r["payload"])) for r in rows]
+
+    def delete_events_from(self, conversation_id: str, event_id: int) -> None:
+        """Delete a conversation's events from event_id (inclusive) onward."""
+        with self.db:
+            self.db.execute("DELETE FROM events WHERE conversation_id = ? AND id >= ?", (conversation_id, event_id))
 
     def events(self, conversation_id: str | None = None, task_id: str | None = None) -> list[dict[str, Any]]:
         if conversation_id:

@@ -16,12 +16,12 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import gitops, remote
+from . import gitops, launcher, remote
 from .admin import Admin, AdminError
 from .bus import Bus
 from .chat import ChatManager
 from .checkpoints import CheckpointError, Checkpoints
-from .config import PROJECT_ROOT, SCRATCH_DIR, load_config
+from .config import PROJECT_ROOT, load_config
 from .notify import Notifier
 from .review import review_workspace
 from .store import Store
@@ -153,6 +153,26 @@ def remote_info(request: Request) -> dict:
     return info
 
 
+class OpenUrl(BaseModel):
+    url: str
+
+
+def web_url(url: str) -> bool:
+    parts = urlsplit(url)
+    return parts.scheme.lower() in ("http", "https") and bool(parts.netloc)
+
+
+@app.post("/api/open-url")
+def open_url(body: OpenUrl, request: Request) -> dict:
+    """Open a link from the app in the default browser, so the app window itself never navigates away."""
+    if not web_url(body.url):
+        raise HTTPException(400, "only http and https links can be opened")
+    if request.client is None or request.client.host not in LOOPBACK:
+        raise HTTPException(403, "links open on this computer only; open it on your device instead")
+    launcher.open_app(body.url, tab=True)
+    return {"ok": True}
+
+
 @app.post("/api/notify/test")
 async def test_notification() -> dict:
     if not notifier.enabled:
@@ -248,6 +268,11 @@ class NewConversation(BaseModel):
     mode: Mode = "agent"
 
 
+class EditMessage(BaseModel):
+    index: int  # which user message, counting from 0
+    text: str
+
+
 class ConversationPatch(BaseModel):
     title: str | None = None
     repo: str | None = None
@@ -318,11 +343,25 @@ async def delete_conversation(conv_id: str) -> dict:
     return {"ok": True}
 
 
+@app.post("/api/conversations/{conv_id}/edit")
+async def edit_message(conv_id: str, body: EditMessage) -> dict:
+    """Replace a user message: discard it and everything after (undoing file changes), then run the new text."""
+    store.conversation(conv_id) or _not_found("conversation")
+    if conv_id in chats.busy():
+        raise HTTPException(409, "wait for the current turn to finish before editing a message")
+    if not body.text.strip():
+        raise HTTPException(400, "the message is empty")
+    try:
+        chats.edit(conv_id, body.index, body.text)
+    except (IndexError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True}
+
+
 @app.post("/api/checkpoints/{checkpoint_id}/restore")
 async def restore_checkpoint(checkpoint_id: str) -> dict:
-    roots = [r.path for r in config.repos] + [SCRATCH_DIR.resolve()]
     try:
-        files = checkpoints.restore(checkpoint_id, roots)
+        files = checkpoints.restore(checkpoint_id, chats.checkpoint_roots())
     except CheckpointError as exc:
         raise HTTPException(400, str(exc)) from exc
     await bus.publish({"type": "checkpoint_restored", "id": checkpoint_id, "files": files})

@@ -1,5 +1,7 @@
+import asyncio
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -232,3 +234,398 @@ async def test_restored_checkpoints_are_reported(tmp_path, repo):
     assert cps.restored_ids([saved["id"]]) == set()
     cps.restore(saved["id"], [repo.resolve()])
     assert cps.restored_ids([saved["id"], "other"]) == {saved["id"]}
+
+
+# links open in the default browser
+
+def test_open_url_accepts_web_links_only(monkeypatch):
+    from fastapi import HTTPException
+
+    from personal_agent import server
+
+    local, phone = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")), SimpleNamespace(client=SimpleNamespace(host="100.64.0.5"))
+    opened = []
+    monkeypatch.setattr(server.launcher, "open_app", lambda url, tab=False: opened.append((url, tab)))
+    assert server.open_url(server.OpenUrl(url="https://example.com/a?b=1"), local) == {"ok": True}
+    assert server.open_url(server.OpenUrl(url="HTTP://example.com"), local)
+    for url in ("javascript:alert(1)", "file:///C:/Windows/win.ini", "ms-settings:", "http:no-host", "/relative", ""):
+        with pytest.raises(HTTPException) as exc:
+            server.open_url(server.OpenUrl(url=url), local)
+        assert exc.value.status_code == 400, url
+    with pytest.raises(HTTPException) as exc:  # a phone must not open tabs on this computer
+        server.open_url(server.OpenUrl(url="https://example.com"), phone)
+    assert exc.value.status_code == 403
+    assert opened == [("https://example.com/a?b=1", True), ("HTTP://example.com", True)]
+
+
+def test_open_url_rejects_cross_origin_posts(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from personal_agent import server
+
+    opened = []
+    monkeypatch.setattr(server.launcher, "open_app", lambda url, tab=False: opened.append(url))
+    client = TestClient(server.app, client=("127.0.0.1", 50000))
+    host = "127.0.0.1:8000"  # an allowed host, so only the Origin decides
+    response = client.post("/api/open-url", json={"url": "https://example.com"},
+                           headers={"Host": host, "Origin": "https://evil.example"})
+    assert response.status_code == 403 and response.json()["detail"] == "forbidden origin"
+    assert opened == []
+    response = client.post("/api/open-url", json={"url": "https://example.com"},
+                           headers={"Host": host, "Origin": f"http://{host}"})
+    assert response.status_code == 200 and opened == ["https://example.com"]
+
+
+# editing a message rewinds the conversation
+
+REJECTION = "Resume rejected by --resume-drops-turn: entries after the fork point belong to another turn"
+
+
+class FakeAgent:
+    """Stands in for run_agent: a session, a reply and a result per turn. No network."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []  # (options, prompt, prompt_uuid) per chat turn
+        self.writes: dict[int, tuple[Path, str]] = {}  # turn number -> file that turn writes
+        self.reject_forks: str | None = None  # "raise" or "result": how the CLI refuses a fork
+        self.hang = False  # stop after the first message, until cancelled
+
+    async def __call__(self, options, prompt, store, bus, kind, ref, prompt_uuid=None):
+        if kind == "title":
+            yield {"type": "result", "result": None, "is_error": False}
+            return
+        self.calls.append((options, prompt, prompt_uuid))
+        n = len(self.calls)
+        if self.reject_forks and options.fork_session:
+            if self.reject_forks == "raise":
+                from claude_agent_sdk import ProcessError
+
+                raise ProcessError(REJECTION, exit_code=1)
+            yield {"type": "result", "is_error": True, "num_turns": 0, "cost_usd": 0.0, "errors": [REJECTION],
+                   "session_id": "", "result": None}
+            return
+        if n in self.writes:
+            await write_through_hooks(options, f"tool-{n}", *self.writes[n])
+        yield {"type": "session", "session_id": f"s{n}" if options.fork_session else options.resume or f"s{n}"}
+        if self.hang:
+            await asyncio.Event().wait()
+        yield {"type": "text", "agent": "main", "text": f"reply {n}"}
+        yield {"type": "result", "is_error": False, "num_turns": 1, "cost_usd": 0.0, "errors": None,
+               "session_id": f"s{n}" if options.fork_session else options.resume or f"s{n}"}
+
+
+async def write_through_hooks(options, tool_use_id: str, path: Path, text: str) -> None:
+    from personal_agent.checkpoints import FILE_TOOLS
+
+    data = {"tool_name": "Write", "tool_input": {"file_path": str(path)}}
+    for event in ("PreToolUse", "PostToolUse"):
+        for matcher in options.hooks[event]:
+            if matcher.matcher == FILE_TOOLS:
+                await matcher.hooks[0](data, tool_use_id, None)
+        if event == "PreToolUse":
+            path.write_text(text, newline="")
+
+
+@pytest.fixture
+def chat(tmp_path, repo, monkeypatch):
+    from personal_agent import chat as chat_module
+    from personal_agent import checkpoints as checkpoints_module
+    from personal_agent.bus import Bus
+    from personal_agent.config import Config
+
+    monkeypatch.setattr(checkpoints_module, "CHECKPOINT_DIR", tmp_path / "checkpoints")
+    agent = FakeAgent()
+    monkeypatch.setattr(chat_module, "run_agent", agent)
+    store = Store(tmp_path / "t.db")
+    config = Config(repos=[Repo(name="r", path=repo, access=Access.WRITE)])
+    manager = chat_module.ChatManager(config, store, Bus(), None, Checkpoints(store))
+    return manager, store, agent, store.create_conversation("r", "agent")["id"]
+
+
+def transcript_entry(u: str) -> SimpleNamespace:
+    """A transcript message: prompts are our UUID4s, "r..." a tool result, anything else the assistant."""
+    if len(u) == 36:
+        return SimpleNamespace(uuid=u, type="user", message={"role": "user", "content": "a prompt"})
+    if u.startswith("r"):
+        return SimpleNamespace(uuid=u, type="user", message={
+            "role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": "ok"}]})
+    return SimpleNamespace(uuid=u, type="assistant", message={"role": "assistant", "content": []})
+
+
+def fake_transcript(monkeypatch, store, conv_id: str, sessions: dict[str, list[str]] | None = None) -> list[str]:
+    """Point get_session_messages at a transcript: by default every turn so far in one session
+    (prompt, tool call, tool result, reply...), or the given entry UUIDs per session."""
+    from personal_agent import chat as chat_module
+
+    prompts = [e["prompt_uuid"] for e in store.events(conversation_id=conv_id) if e["type"] == "user"]
+    entries = [u for i, p in enumerate(prompts, 1) for u in (p, f"t{i}", f"r{i}", f"a{i}")]
+    monkeypatch.setattr(
+        chat_module, "get_session_messages",
+        lambda session_id, directory=None: [
+            transcript_entry(u) for u in (entries if sessions is None else sessions.get(session_id, []))
+        ],
+    )
+    return prompts
+
+
+async def finish(manager, conv_id: str) -> None:
+    await manager.running[conv_id]
+    await asyncio.sleep(0)  # let the title task finish
+
+
+async def say(manager, conv_id: str, text: str) -> None:
+    assert manager.start(conv_id, text)
+    await finish(manager, conv_id)
+
+
+def transcript(store, conv_id: str) -> list[tuple[str, str]]:
+    return [(e["type"], e.get("text") or e.get("message")) for e in store.events(conversation_id=conv_id)
+            if e["type"] in ("user", "text", "warning")]
+
+
+async def test_turns_record_session_and_prompt_uuid(chat):
+    manager, store, agent, conv_id = chat
+    await say(manager, conv_id, "first")
+    await say(manager, conv_id, "second")
+    first, second = [e for e in store.events(conversation_id=conv_id) if e["type"] == "user"]
+    assert first["session_id"] == "s1" and second["session_id"] == "s1"
+    assert agent.calls[1][0].resume == "s1"
+    assert [first["prompt_uuid"], second["prompt_uuid"]] == [agent.calls[0][2], agent.calls[1][2]]
+
+
+async def test_edit_truncates_and_forks_the_session(chat, monkeypatch):
+    manager, store, agent, conv_id = chat
+    for text in ("first", "second", "third"):
+        await say(manager, conv_id, text)
+    prompts = fake_transcript(monkeypatch, store, conv_id)
+
+    manager.edit(conv_id, 1, "second, edited")
+    assert transcript(store, conv_id) == [("user", "first"), ("text", "reply 1")]  # dropped right away
+    assert store.conversation(conv_id)["session_id"] is None
+    await finish(manager, conv_id)
+
+    options, prompt, _ = agent.calls[-1]
+    assert prompt == "second, edited"  # the forked session has the context, so no recap
+    assert (options.resume, options.fork_session, options.resume_session_at) == ("s1", True, "a1")
+    # Two turns are discarded ("second" and "third"), which the CLI's one-turn guard would refuse.
+    assert options.resume_drops_turn is None and prompts[2] != prompts[1]
+    assert transcript(store, conv_id) == [
+        ("user", "first"), ("text", "reply 1"), ("user", "second, edited"), ("text", "reply 4")]
+    assert store.conversation(conv_id)["session_id"] == "s4"  # the fork's new session
+
+
+async def test_edit_of_the_last_message_guards_the_dropped_turn(chat, monkeypatch):
+    manager, store, agent, conv_id = chat
+    await say(manager, conv_id, "first")
+    await say(manager, conv_id, "second")
+    prompts = fake_transcript(monkeypatch, store, conv_id)
+    manager.edit(conv_id, 1, "second, edited")
+    await finish(manager, conv_id)
+    options = agent.calls[-1][0]
+    assert (options.resume_session_at, options.resume_drops_turn) == ("a1", prompts[1])
+
+
+async def test_edit_forks_from_the_session_the_message_went_to(chat, monkeypatch):
+    manager, store, agent, conv_id = chat
+    await say(manager, conv_id, "first")
+    await say(manager, conv_id, "second")
+    first_prompt, second_prompt = fake_transcript(monkeypatch, store, conv_id)
+    manager.edit(conv_id, 1, "second, edited")  # forks s1 into s3
+    await finish(manager, conv_id)
+    await say(manager, conv_id, "third")  # resumes s3
+    edited, third = [e for e in store.events(conversation_id=conv_id) if e["type"] == "user"][1:]
+    assert edited["session_id"] == third["session_id"] == "s3"
+    # The fork copied the kept history under new UUIDs; only its transcript knows them.
+    fake_transcript(monkeypatch, store, conv_id, {
+        "s1": [first_prompt, "a1", second_prompt, "a2"],
+        "s3": ["c1", "c2", edited["prompt_uuid"], "a3", third["prompt_uuid"], "a4"],
+    })
+    manager.edit(conv_id, 2, "third, edited")
+    await finish(manager, conv_id)
+    options = agent.calls[-1][0]
+    assert (options.resume, options.resume_session_at, options.resume_drops_turn) == ("s3", "a3", third["prompt_uuid"])
+
+
+async def test_second_edit_counts_turns_an_earlier_edit_dropped(chat, monkeypatch):
+    manager, store, agent, conv_id = chat
+    for text in ("A", "B", "C"):
+        await say(manager, conv_id, text)
+    a, b, c = fake_transcript(monkeypatch, store, conv_id)
+    manager.edit(conv_id, 2, "C'")  # forks s1 into s4; C is gone from our history but not from s1
+    await finish(manager, conv_id)
+    edited = store.events(conversation_id=conv_id)[-3]
+    assert edited["text"] == "C'" and edited["session_id"] == "s4"
+    fake_transcript(monkeypatch, store, conv_id, {
+        "s1": [a, "a1", b, "a2", c, "a3"],
+        "s4": ["c1", "c2", "c3", "c4", edited["prompt_uuid"], "a4"],
+    })
+    manager.edit(conv_id, 1, "B'")  # B still points at s1, where C's turn follows it
+    await finish(manager, conv_id)
+    options = agent.calls[-1][0]
+    # Guarding the drop of B's turn alone would be refused (C follows), so truncate unguarded.
+    assert (options.resume, options.resume_session_at, options.resume_drops_turn) == ("s1", "a1", None)
+    assert agent.calls[-1][1] == "B'"  # forked, not recapped
+    assert not any(e["type"] == "warning" for e in store.events(conversation_id=conv_id))
+
+
+@pytest.mark.parametrize("how", ["raise", "result"])
+async def test_edit_falls_back_to_recap_when_fork_is_rejected(chat, monkeypatch, how):
+    manager, store, agent, conv_id = chat
+    await say(manager, conv_id, "first")
+    await say(manager, conv_id, "second")
+    fake_transcript(monkeypatch, store, conv_id)
+    agent.reject_forks = how
+
+    manager.edit(conv_id, 1, "again")
+    await finish(manager, conv_id)
+    rejected, (options, prompt, _) = agent.calls[-2][0], agent.calls[-1]
+    assert rejected.fork_session and rejected.resume == "s1"  # tried the fork first
+    assert not options.fork_session and options.resume is None  # then a fresh session, not a plain resume
+    assert prompt.startswith("Earlier in this conversation:") and "User: first" in prompt and "second" not in prompt
+    events = store.events(conversation_id=conv_id)
+    assert [e["type"] for e in events][-4:] == ["user", "warning", "text", "result"]  # no error, no rejected result
+    assert events[-4]["session_id"] == "s4" and store.conversation(conv_id)["session_id"] == "s4"
+
+
+async def test_edit_first_message_without_fork_point_starts_fresh(chat, monkeypatch):
+    manager, store, agent, conv_id = chat
+    await say(manager, conv_id, "first")
+    fake_transcript(monkeypatch, store, conv_id)  # the prompt is the session's first entry: nothing to fork at
+    manager.edit(conv_id, 0, "first, edited")
+    await finish(manager, conv_id)
+    options, prompt, _ = agent.calls[-1]
+    assert prompt == "first, edited" and options.resume is None and not options.fork_session
+    assert transcript(store, conv_id) == [("user", "first, edited"), ("text", "reply 2")]
+
+
+async def test_edit_falls_back_when_transcript_is_missing(chat, monkeypatch):
+    manager, store, agent, conv_id = chat
+    await say(manager, conv_id, "first")
+    await say(manager, conv_id, "second")
+    fake_transcript(monkeypatch, store, conv_id, {})  # e.g. the repo changed and the session lives elsewhere
+    manager.edit(conv_id, 1, "again")
+    await finish(manager, conv_id)
+    options, prompt, _ = agent.calls[-1]
+    assert options.resume is None and not options.fork_session
+    assert prompt.startswith("Earlier in this conversation:") and "second" not in prompt
+
+
+async def until(condition) -> None:
+    for _ in range(100):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("timed out")
+
+
+async def test_stopped_first_turn_keeps_its_session(chat):
+    manager, store, agent, conv_id = chat
+    agent.hang = True
+    assert manager.start(conv_id, "first")
+    await until(lambda: store.conversation(conv_id)["session_id"] == "s1")
+    manager.stop(conv_id)
+    await finish(manager, conv_id)
+    user, stopped = store.events(conversation_id=conv_id)
+    assert stopped["type"] == "stopped" and user["session_id"] == "s1"  # from the session event, not a result
+    agent.hang = False
+    await say(manager, conv_id, "go on")
+    assert agent.calls[-1][0].resume == "s1" and agent.calls[-1][1] == "go on"
+
+
+async def test_edit_a_stopped_message(chat, monkeypatch):
+    manager, store, agent, conv_id = chat
+    await say(manager, conv_id, "first")
+    agent.hang = True
+    assert manager.start(conv_id, "second")
+    await until(lambda: len(agent.calls) == 2)
+    await asyncio.sleep(0)
+    manager.stop(conv_id)
+    await finish(manager, conv_id)
+    assert [e["type"] for e in store.events(conversation_id=conv_id)][-2:] == ["user", "stopped"]
+
+    agent.hang = False
+    prompts = fake_transcript(monkeypatch, store, conv_id)
+    manager.edit(conv_id, 1, "second, edited")
+    await finish(manager, conv_id)
+    options = agent.calls[-1][0]
+    assert (options.resume, options.resume_session_at, options.resume_drops_turn) == ("s1", "a1", prompts[1])
+    assert transcript(store, conv_id)[-2:] == [("user", "second, edited"), ("text", "reply 3")]
+
+
+async def test_edit_rejects_busy_conversation(chat, monkeypatch):
+    from fastapi import HTTPException
+
+    from personal_agent import server
+
+    manager, store, agent, conv_id = chat
+    await say(manager, conv_id, "first")
+    monkeypatch.setattr(server, "store", store)
+    monkeypatch.setattr(server, "chats", manager)
+    manager.running[conv_id] = asyncio.get_running_loop().create_future()  # a turn in progress
+    with pytest.raises(ValueError):
+        manager.edit(conv_id, 0, "x")
+    with pytest.raises(HTTPException) as exc:
+        await server.edit_message(conv_id, server.EditMessage(index=0, text="x"))
+    assert exc.value.status_code == 409
+    manager.running.pop(conv_id)
+    for index, text in ((5, "x"), (-1, "x"), (0, "  ")):
+        with pytest.raises(HTTPException) as exc:
+            await server.edit_message(conv_id, server.EditMessage(index=index, text=text))
+        assert exc.value.status_code == 400
+    assert transcript(store, conv_id) == [("user", "first"), ("text", "reply 1")]  # nothing was removed
+    assert store.conversation(conv_id)["session_id"] == "s1"
+
+
+async def test_refused_edit_touches_nothing(chat, repo):
+    manager, store, agent, conv_id = chat
+    agent.writes = {1: (repo / "app.py", "one\n")}
+    await say(manager, conv_id, "change it")
+    before = store.events(conversation_id=conv_id)
+    store.update_conversation(conv_id, repo="gone")  # the repo was removed from config.yaml since
+    with pytest.raises(ValueError, match="no longer configured"):
+        manager.edit(conv_id, 0, "never mind")
+    assert (repo / "app.py").read_text() == "one\n"  # not restored
+    assert manager.checkpoints.restored_ids([e["id"] for e in before if e["type"] == "checkpoint"]) == set()
+    assert store.events(conversation_id=conv_id) == before and store.conversation(conv_id)["session_id"] == "s1"
+    assert conv_id not in manager.running
+
+
+async def test_edit_undoes_discarded_turns_newest_first(chat, repo):
+    manager, store, agent, conv_id = chat
+    original = (repo / "app.py").read_text()
+    agent.writes = {1: (repo / "kept.py", "kept\n"), 2: (repo / "app.py", "two\n"), 3: (repo / "app.py", "three\n")}
+    for text in ("add a file", "change it", "change it again"):
+        await say(manager, conv_id, text)
+    assert (repo / "app.py").read_text() == "three\n"
+    assert sum(e["type"] == "checkpoint" for e in store.events(conversation_id=conv_id)) == 3
+
+    manager.edit(conv_id, 1, "do something else")
+    assert (repo / "app.py").read_text() == original  # the oldest original wins, not the state after turn 2
+    assert (repo / "kept.py").read_text() == "kept\n"  # the kept turn's change stays
+    await finish(manager, conv_id)
+    assert [e["type"] for e in store.events(conversation_id=conv_id)].count("checkpoint") == 1
+    assert not any(e["type"] == "warning" for e in store.events(conversation_id=conv_id))
+
+
+async def test_edit_skips_undone_turns_and_warns_on_failure(chat, repo, monkeypatch):
+    manager, store, agent, conv_id = chat
+    agent.writes = {1: (repo / "app.py", "one\n"), 2: (repo / "new.py", "x\n")}
+    await say(manager, conv_id, "change it")
+    await say(manager, conv_id, "add a file")
+    first, second = [e["id"] for e in store.events(conversation_id=conv_id) if e["type"] == "checkpoint"]
+    manager.checkpoints.restore(second, manager.checkpoint_roots())  # already undone by hand
+    (repo / "new.py").write_text("recreated\n")
+
+    real_restore = manager.checkpoints.restore
+
+    def restore(checkpoint_id, roots):
+        if checkpoint_id == first:
+            raise OSError("file is locked")
+        return real_restore(checkpoint_id, roots)
+
+    monkeypatch.setattr(manager.checkpoints, "restore", restore)
+    manager.edit(conv_id, 0, "never mind")
+    await finish(manager, conv_id)
+    assert (repo / "new.py").read_text() == "recreated\n"  # the undone turn is not restored again
+    assert [t for t, _ in transcript(store, conv_id)] == ["user", "warning", "text"]
+    assert "file is locked" in transcript(store, conv_id)[1][1]
