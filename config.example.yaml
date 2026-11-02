@@ -1,0 +1,31 @@
+# Copy to config.yaml (git-ignored) and list the repos the agents may touch.
+# access: read  -> agents can read and run read-only commands; every file edit is blocked
+# access: write -> agents can edit files (they still can't push to main, force-push, or merge)
+repos:
+  - name: my-app
+    path: C:/Users/you/code/my-app      # or /home/you/code/my-app
+    access: write
+    github: you/my-app                  # optional, owner/repo
+
+models:            # aliases ("opus", "sonnet", "haiku") or full model IDs
+  orchestrator: sonnet
+  implementer: opus
+  reviewer: opus
+  researcher: sonnet
+
+max_turns: 60
+port: 8000
+
+# subscription: always bill agent runs to your claude.ai plan (API keys in the environment are ignored)
+# api: allow ANTHROPIC_API_KEY, billed to your Claude Platform account
+billing: subscription
+
+# Remote access (e.g. from your phone over Tailscale). Every device must sign in with the
+# token stored in data/remote_token. Leave disabled unless you need it.
+remote:
+  enabled: false
+  host: 0.0.0.0
+
+# Optional push notifications through https://ntfy.sh. Use a long, unguessable topic name.
+notifications:
+  ntfy_topic: null

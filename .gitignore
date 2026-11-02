@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local state and secrets: never commit
+data/
+config.yaml
+.env
+.env.*
+*.db
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
