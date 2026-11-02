@@ -29,3 +29,6 @@ remote:
 # Optional push notifications through https://ntfy.sh. Use a long, unguessable topic name.
 notifications:
   ntfy_topic: null
+
+# Run commits, pushes, PRs, installs etc. without asking. Merging a PR always asks; hard blocks still apply.
+auto_approve: false

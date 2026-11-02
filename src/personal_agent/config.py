@@ -67,6 +67,9 @@ class Config(BaseModel):
     notifications: Notifications = Field(default_factory=Notifications)
     # "subscription": always use your claude.ai plan login (API keys in the environment are ignored).
     # "api": allow ANTHROPIC_API_KEY to be used, billed to your Claude Platform account.
+    # true: commits, pushes, PRs, installs and edits to config/guards run without prompting. Merging a PR
+    # always asks, and hard blocks (force push, push to main, reset --hard) still apply.
+    auto_approve: bool = False
     billing: Literal["subscription", "api"] = "subscription"
 
     def repo(self, name: str) -> Repo:

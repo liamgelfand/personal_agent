@@ -91,8 +91,9 @@ A guard runs before every tool call:
 | Files outside delegated repos | blocked | blocked | blocked |
 
 Always blocked: force-push, pushing to main/master, `git reset --hard`, `git clean -f`,
-`gh pr merge`, `gh repo delete`, and the PowerShell tool. Needs approval: `git commit`,
-`git push`, `gh pr/issue create|edit|comment`, package installs, `curl | sh`, `docker`.
+`gh repo delete`, and the PowerShell tool. Always needs approval: merging a PR.
+With `auto_approve: false` also: `git commit`, `git push`, `gh pr/issue create|edit|comment`,
+package installs, `curl | sh`, `docker`.
 Bash in writable workspaces can still reach anything your user account can, so this is a
 guardrail, not a sandbox. Only delegate repos you are comfortable with an agent changing.
 

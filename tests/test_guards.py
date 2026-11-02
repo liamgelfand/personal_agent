@@ -62,7 +62,6 @@ def test_powershell_is_denied(repos):
         "git reset --hard HEAD~3",
         "git clean -fdx",
         "rm -rf /",
-        "gh pr merge 12",
         "gh repo delete me/x --yes",
     ],
 )
@@ -121,6 +120,12 @@ def test_read_only_repo_blocks_writes_via_bash(repos, command):
 )
 def test_read_only_repo_allows_inspection(repos, command):
     assert check_tool_use("Bash", {"command": command}, repos, repos[1].path) is None
+
+
+def test_merging_a_pr_always_asks(repos):
+    for command in ("gh pr merge 12", "gh api -X PUT repos/o/r/pulls/3/merge"):
+        decision = check_tool_use("Bash", {"command": command}, repos, repos[0].path)
+        assert decision is not None and decision.action == "ask" and decision.always_ask, command
 
 
 def test_protected_self_files_need_approval(tmp_path):
