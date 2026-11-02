@@ -36,6 +36,7 @@ export const api = {
   updateConversation: (id: string, patch: { title?: string; repo?: string; unlink?: boolean; mode?: Mode }) =>
     request<Conversation>('PATCH', `/api/conversations/${id}`, patch),
   deleteConversation: (id: string) => request('DELETE', `/api/conversations/${id}`),
+  openUrl: (url: string) => request('POST', '/api/open-url', { url }),
 
   tasks: () => request<Task[]>('GET', '/api/tasks'),
   task: (id: string) => request<Task & { events: AgentEvent[] }>('GET', `/api/tasks/${id}`),

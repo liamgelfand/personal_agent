@@ -8,6 +8,7 @@ import { send } from '../socket'
 import { useApp } from '../store'
 import type { Conversation, Mode } from '../types'
 import { EventView } from './EventList'
+import { markdownComponents } from './ExternalLink'
 
 function ago(ts: number) {
   const s = Date.now() / 1000 - ts
@@ -269,7 +270,7 @@ function ConversationView({ id }: { id: string }) {
         ))}
         {streaming && (
           <div className="msg-text streaming-caret">
-            <Markdown remarkPlugins={[remarkGfm]}>{streaming}</Markdown>
+            <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{streaming}</Markdown>
           </div>
         )}
         {busy && !streaming && (

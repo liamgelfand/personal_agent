@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import gitops, remote
+from . import gitops, launcher, remote
 from .admin import Admin, AdminError
 from .bus import Bus
 from .chat import ChatManager
@@ -151,6 +151,26 @@ def remote_info(request: Request) -> dict:
     if config.remote.enabled and local:
         info["token"] = remote.token()  # only shown on this computer
     return info
+
+
+class OpenUrl(BaseModel):
+    url: str
+
+
+def web_url(url: str) -> bool:
+    parts = urlsplit(url)
+    return parts.scheme.lower() in ("http", "https") and bool(parts.netloc)
+
+
+@app.post("/api/open-url")
+def open_url(body: OpenUrl, request: Request) -> dict:
+    """Open a link from the app in the default browser, so the app window itself never navigates away."""
+    if not web_url(body.url):
+        raise HTTPException(400, "only http and https links can be opened")
+    if request.client is None or request.client.host not in LOOPBACK:
+        raise HTTPException(403, "links open on this computer only; open it on your device instead")
+    launcher.open_app(body.url, tab=True)
+    return {"ok": True}
 
 
 @app.post("/api/notify/test")
