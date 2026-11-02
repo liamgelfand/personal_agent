@@ -21,7 +21,7 @@ from .admin import Admin, AdminError
 from .bus import Bus
 from .chat import ChatManager
 from .checkpoints import CheckpointError, Checkpoints
-from .config import PROJECT_ROOT, SCRATCH_DIR, load_config
+from .config import PROJECT_ROOT, load_config
 from .notify import Notifier
 from .review import review_workspace
 from .store import Store
@@ -268,6 +268,11 @@ class NewConversation(BaseModel):
     mode: Mode = "agent"
 
 
+class EditMessage(BaseModel):
+    index: int  # which user message, counting from 0
+    text: str
+
+
 class ConversationPatch(BaseModel):
     title: str | None = None
     repo: str | None = None
@@ -338,11 +343,25 @@ async def delete_conversation(conv_id: str) -> dict:
     return {"ok": True}
 
 
+@app.post("/api/conversations/{conv_id}/edit")
+async def edit_message(conv_id: str, body: EditMessage) -> dict:
+    """Replace a user message: discard it and everything after (undoing file changes), then run the new text."""
+    store.conversation(conv_id) or _not_found("conversation")
+    if conv_id in chats.busy():
+        raise HTTPException(409, "wait for the current turn to finish before editing a message")
+    if not body.text.strip():
+        raise HTTPException(400, "the message is empty")
+    try:
+        chats.edit(conv_id, body.index, body.text)
+    except (IndexError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True}
+
+
 @app.post("/api/checkpoints/{checkpoint_id}/restore")
 async def restore_checkpoint(checkpoint_id: str) -> dict:
-    roots = [r.path for r in config.repos] + [SCRATCH_DIR.resolve()]
     try:
-        files = checkpoints.restore(checkpoint_id, roots)
+        files = checkpoints.restore(checkpoint_id, chats.checkpoint_roots())
     except CheckpointError as exc:
         raise HTTPException(400, str(exc)) from exc
     await bus.publish({"type": "checkpoint_restored", "id": checkpoint_id, "files": files})

@@ -8,10 +8,19 @@ type ServerEvent = { type: string; [key: string]: unknown }
 let socket: WebSocket | null = null
 let retry = 0
 
-const PERSISTED = new Set(['user', 'text', 'tool', 'result', 'task_link', 'review', 'error', 'stopped', 'checkpoint'])
+const PERSISTED = new Set([
+  'user', 'text', 'tool', 'result', 'task_link', 'review', 'error', 'warning', 'stopped', 'checkpoint',
+])
 
 function append(map: Record<string, AgentEvent[]>, key: string, event: AgentEvent) {
   return { ...map, [key]: [...(map[key] ?? []), event] }
+}
+
+// The events before the index-th user message (what remains after that message is edited).
+export function beforeUserMessage(events: AgentEvent[], index: number) {
+  let seen = -1
+  const cut = events.findIndex((e) => e.type === 'user' && ++seen === index)
+  return cut < 0 ? events : events.slice(0, cut)
 }
 
 function handle(e: ServerEvent) {
@@ -102,6 +111,12 @@ function handle(e: ServerEvent) {
       return
     case 'admin_restarting':
       set({ restarting: true })
+      return
+    case 'conversation_rewound':
+      // A message was edited: it and everything after it are gone; the new turn streams in next.
+      if (conv && s.convEvents[conv]) {
+        set({ convEvents: { ...s.convEvents, [conv]: beforeUserMessage(s.convEvents[conv], e.index as number) } })
+      }
       return
     case 'checkpoint_restored':
       set({ undone: { ...s.undone, [e.id as string]: true } })
