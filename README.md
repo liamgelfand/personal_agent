@@ -35,6 +35,18 @@ python -m uv run personal-agent      # http://127.0.0.1:8000
 ```
 
 The command runs a small supervisor, so the app can restart itself from the browser.
+
+### Desktop shortcut (Windows)
+
+```sh
+python -m uv run python -m personal_agent.launcher --install-shortcut
+```
+
+This adds a "Personal Agent" shortcut to your Desktop and Start menu. It starts the server in
+the background (no terminal; output goes to `data/logs/server.log`) if it isn't already running,
+then opens the app in your default browser: as a standalone app window for Chrome, Edge, Brave,
+and Vivaldi, or a normal tab otherwise. Opening it again reuses the running server. To stop the
+server: `python -m uv run python -m personal_agent.launcher --stop`.
 For UI development with hot reload, also run `cd frontend && npm run dev` and open
 http://127.0.0.1:5173.
 

@@ -5,6 +5,9 @@ export function fuzzyScore(query: string, path: string): number | null {
   const q = query.toLowerCase()
   const p = path.toLowerCase()
   const nameStart = p.lastIndexOf('/') + 1
+  // The query inside the file name beats any scattered match; at the start of the name, more so.
+  const inName = p.slice(nameStart).indexOf(q)
+  if (inName >= 0) return 1000 + (inName === 0 ? 500 : 0) - path.length * 0.01
   let score = 0
   let pi = 0
   let streak = 0

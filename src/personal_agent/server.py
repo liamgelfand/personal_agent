@@ -229,6 +229,15 @@ async def admin_restart(force: bool = False) -> dict:
     return {"restarting": True}
 
 
+@app.post("/api/admin/shutdown")
+async def admin_shutdown(force: bool = False) -> dict:
+    busy = _busy()
+    if any(busy.values()) and not force:
+        raise HTTPException(409, f"agents are running ({busy}); wait or force the shutdown")
+    await admin.shutdown()
+    return {"stopping": True}
+
+
 # conversations
 
 Mode = Literal["agent", "chat"]
@@ -269,7 +278,13 @@ def create_conversation(body: NewConversation) -> dict:
 @app.get("/api/conversations/{conv_id}")
 def get_conversation(conv_id: str) -> dict:
     conv = store.conversation(conv_id) or _not_found("conversation")
-    return {**conv, "busy": conv_id in chats.busy(), "events": store.events(conversation_id=conv_id)}
+    events = store.events(conversation_id=conv_id)
+    # Mark turns that were undone, so the transcript doesn't offer Undo twice after a reload.
+    restored = checkpoints.restored_ids([e["id"] for e in events if e["type"] == "checkpoint"])
+    for e in events:
+        if e["type"] == "checkpoint":
+            e["restored"] = e["id"] in restored
+    return {**conv, "busy": conv_id in chats.busy(), "events": events}
 
 
 @app.patch("/api/conversations/{conv_id}")

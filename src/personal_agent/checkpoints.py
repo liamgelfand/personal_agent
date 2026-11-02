@@ -96,6 +96,15 @@ class Checkpoints:
             )
         return {"id": checkpoint.id, "files": [f["path"] for f in files]}
 
+    def restored_ids(self, ids: list[str]) -> set[str]:
+        if not ids:
+            return set()
+        marks = ",".join("?" * len(ids))
+        rows = self.db.execute(
+            f"SELECT id FROM checkpoints WHERE restored_at IS NOT NULL AND id IN ({marks})", ids
+        )
+        return {r["id"] for r in rows}
+
     def restore(self, checkpoint_id: str, allowed_roots: list[Path]) -> list[str]:
         row = self.db.execute("SELECT * FROM checkpoints WHERE id = ?", (checkpoint_id,)).fetchone()
         if not row:

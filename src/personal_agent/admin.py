@@ -74,6 +74,11 @@ class Admin:
             self.building = False
             await self.bus.publish({"type": "admin_build_done", "ok": ok, **self.status()})
 
+    async def shutdown(self) -> None:
+        """Stop for good: exit code 0 tells the supervisor not to start the server again."""
+        await self.bus.publish({"type": "admin_shutdown"})
+        asyncio.get_running_loop().call_later(0.5, os._exit, 0)
+
     async def restart(self) -> None:
         if not self.supervised:
             raise AdminError("restart needs the server started with `uv run personal-agent`")
