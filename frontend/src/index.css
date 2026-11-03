@@ -330,6 +330,13 @@ svg { flex-shrink: 0; }
   padding: 10px 12px; border-radius: var(--radius-lg); background: var(--surface-2); border: 1px solid var(--border);
   white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 6px;
 }
+.user-turn { position: relative; }
+.user-turn .edit-btn { position: absolute; top: 10px; right: 4px; visibility: hidden; background: var(--surface-2); }
+.user-turn:hover .edit-btn, .user-turn .edit-btn:focus-visible { visibility: visible; }
+@media (hover: none) { .user-turn .edit-btn { visibility: visible; } }
+.msg-user.editing { display: flex; flex-direction: column; gap: 8px; white-space: normal; }
+.msg-user.editing textarea { width: 100%; resize: vertical; padding: 6px 8px; line-height: 1.5; }
+.edit-actions { display: flex; justify-content: flex-end; gap: 6px; }
 .msg-text { line-height: 1.6; overflow-wrap: anywhere; }
 .msg-text > :first-child { margin-top: 0; }
 .msg-text > :last-child { margin-bottom: 0; }
@@ -362,6 +369,7 @@ svg { flex-shrink: 0; }
 .link-row:hover .title { text-decoration: underline; }
 .meta-line { font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
 .meta-line.error { color: var(--danger); }
+.meta-line.warning { color: var(--warn); }
 .phase { display: flex; align-items: center; gap: 10px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-3); margin-top: 6px; }
 .phase::after { content: ''; flex: 1; height: 1px; background: var(--border); }
 .working { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-3); }

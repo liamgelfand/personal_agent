@@ -9,6 +9,7 @@ import { useApp } from '../store'
 import type { Conversation, Mode } from '../types'
 import { ChatTabs } from './ChatTabs'
 import { EventView } from './EventList'
+import { markdownComponents } from './ExternalLink'
 
 function ago(ts: number) {
   const s = Date.now() / 1000 - ts
@@ -175,6 +176,11 @@ function ConversationView({ id }: { id: string }) {
   }, [repo])
 
   const suggestions = useMemo(() => (mention ? fuzzyFilter(mention.query, files, 8) : []), [mention, files])
+  // For each event, which user message it is (the server edits by this number), or -1.
+  const userIndex = useMemo(() => {
+    let n = 0
+    return (events ?? []).map((e) => (e.type === 'user' ? n++ : -1))
+  }, [events])
 
   // Block body on purpose: newer Chrome returns a Promise from scrollIntoView, and React
   // would treat any returned value as a cleanup function and crash calling it.
@@ -267,11 +273,11 @@ function ConversationView({ id }: { id: string }) {
           </p>
         )}
         {(events ?? []).map((e, i) => (
-          <EventView key={i} event={e} />
+          <EventView key={i} event={e} edit={userIndex[i] >= 0 ? { convId: id, index: userIndex[i] } : undefined} />
         ))}
         {streaming && (
           <div className="msg-text streaming-caret">
-            <Markdown remarkPlugins={[remarkGfm]}>{streaming}</Markdown>
+            <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{streaming}</Markdown>
           </div>
         )}
         {busy && !streaming && (
