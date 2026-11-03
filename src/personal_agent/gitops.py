@@ -1,23 +1,37 @@
-"""Async git helpers: status, diffs, staging, commits, and worktrees."""
+"""Async git helpers: status, diffs, staging, commits, worktrees, and remotes."""
 
 from __future__ import annotations
 
 import asyncio
+import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 class GitError(RuntimeError):
     pass
 
 
-async def git(root: Path, *args: str, check: bool = True) -> str:
+# For commands that talk to a remote in the background: fail instead of asking for credentials.
+NO_PROMPT = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+
+
+async def git(root: Path, *args: str, check: bool = True, env: dict[str, str] | None = None,
+              timeout: float | None = None) -> str:
     proc = await asyncio.create_subprocess_exec(
         "git", "-C", str(root), *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, **env} if env else None,
     )
-    out, err = await proc.communicate()
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise GitError(f"git {' '.join(args)} timed out") from None
     if check and proc.returncode != 0:
         raise GitError(err.decode(errors="replace").strip() or f"git {' '.join(args)} failed")
     return out.decode(errors="replace")
@@ -145,6 +159,53 @@ async def has_commits(root: Path) -> bool:
 
 async def head_sha(root: Path) -> str:
     return (await git(root, "rev-parse", "HEAD")).strip()
+
+
+async def default_branch(repo: Path) -> str:
+    """The branch PRs target: origin's HEAD branch.
+
+    refs/remotes/origin/HEAD only exists in clones, so a repo that was `git init`ed and pushed asks
+    origin itself. Failing that (offline, say), a pushed main or master; then 'main'.
+    """
+    prefix = "refs/remotes/origin/"
+    ref = (await git(repo, "symbolic-ref", "--quiet", f"{prefix}HEAD", check=False)).strip()
+    if ref.startswith(prefix):
+        return ref.removeprefix(prefix)
+    try:
+        out = await git(repo, "ls-remote", "--symref", "origin", "HEAD", env=NO_PROMPT, timeout=20)
+    except GitError:
+        out = ""
+    for line in out.splitlines():
+        if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
+            return line.removeprefix("ref: refs/heads/").removesuffix("\tHEAD")
+    for name in ("main", "master"):
+        if await _exists(repo, f"{prefix}{name}"):
+            return name
+    return "main"
+
+
+async def remote_url(root: Path, remote: str = "origin") -> str | None:
+    return (await git(root, "remote", "get-url", remote, check=False)).strip() or None
+
+
+_GITHUB_REMOTE = re.compile(
+    r"^(?:https?://(?:[^@/]+@)?github\.com/|ssh://(?:[^@/]+@)?github\.com(?::\d+)?/|[^@/:]+@github\.com:)"
+    r"([^/]+)/([^/]+?)(?:\.git)?/?$"
+)
+
+
+def github_repo(url: str) -> tuple[str, str] | None:
+    """(owner, repo) of a GitHub https or ssh remote URL; None for anything else."""
+    match = _GITHUB_REMOTE.match(url.strip())
+    return (match[1], match[2]) if match else None
+
+
+def compare_url(owner: str, repo: str, base: str, branch: str, title: str) -> str:
+    """GitHub's page for opening a PR of `branch` into `base` by hand."""
+    return (
+        f"https://github.com/{owner}/{repo}/compare/{quote(base)}...{quote(branch)}"
+        f"?expand=1&title={quote(title, safe='')}"
+    )
 
 
 async def add_worktree(repo: Path, path: Path, branch: str) -> None:

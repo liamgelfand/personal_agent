@@ -174,6 +174,251 @@ async def test_failed_merge_leaves_checkout_unchanged(tmp_path, repo):
     assert (await gitops.status(repo))["files"] == []
 
 
+# finishing a task: commit, push, PR
+
+@pytest.fixture
+def finishing(tmp_path, repo, monkeypatch):
+    """A task worktree whose origin looks like GitHub but pushes to a local bare repo; gh is faked."""
+    from personal_agent import tasks as tasks_mod
+    from personal_agent.bus import Bus
+    from personal_agent.config import Config
+
+    bare = tmp_path / "origin.git"
+    sh(tmp_path, "git", "init", "-q", "--bare", str(bare))
+    sh(repo, "git", "remote", "add", "origin", "https://github.com/octo/demo.git")
+    sh(repo, "git", "config", "remote.origin.pushurl", str(bare))
+    sh(repo, "git", "push", "-q", "origin", "main")
+    # As in a clone; without it default_branch would ask the (fake GitHub) origin over the network.
+    sh(repo, "git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    gh_calls: list[tuple[str, ...]] = []
+    gh_replies: dict[str, object] = {"list": "", "create": "https://github.com/octo/demo/pull/7"}
+
+    async def fake_gh(cwd, *args):
+        gh_calls.append(args)
+        reply = gh_replies[args[1]]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(tasks_mod, "_gh", fake_gh)
+    store = Store(tmp_path / "t.db")
+    manager = tasks_mod.TaskManager(Config(repos=[Repo(name="r", path=repo, access=Access.WRITE)]), store, Bus())
+
+    async def add(task_id: str, branch: str, spec: str = "Do it.\n\n## Verify\n- run tests", **fields):
+        wt = tmp_path / "wt" / task_id
+        await gitops.add_worktree(repo, wt, branch)
+        store.create_task(id=task_id, conversation_id=None, repo="r", title="Change greeting", spec=spec,
+                          branch=branch, base_sha=await gitops.head_sha(repo), worktree=str(wt))
+        store.update_task(task_id, status="ready", **fields)
+        return wt
+
+    def pushed(branch: str) -> bool:
+        return subprocess.run(["git", "-C", str(bare), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+                              capture_output=True).returncode == 0
+
+    return SimpleNamespace(manager=manager, store=store, add=add, pushed=pushed, gh_calls=gh_calls,
+                           gh_replies=gh_replies, repo=repo)
+
+
+async def test_finish_commits_pushes_and_opens_pr(finishing):
+    f = finishing
+    wt = await f.add("t1", "agent/greet")
+    (wt / "app.py").write_text("def hello():\n    return 'Hi'\n", newline="")
+    f.store.save_review("r@t1", {"verdict": "approve", "summary": "Looks good", "findings": []})
+
+    task = await f.manager.finish("t1")
+    assert (task["pr_url"], task["pr_state"], task["finish_error"]) == ("https://github.com/octo/demo/pull/7", "open", None)
+    assert task["status"] == "ready" and f.pushed("agent/greet")
+    assert (await gitops.status(wt))["files"] == []
+    message = await gitops.git(wt, "log", "-1", "--format=%B")
+    assert message.startswith("Change greeting\n\nTask t1\n")
+    assert message.strip().endswith("Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>")
+    create = next(c for c in f.gh_calls if c[1] == "create")
+    assert create[create.index("--base") + 1] == "main" and create[create.index("--head") + 1] == "agent/greet"
+    body = create[create.index("--body") + 1]
+    assert "Do it." in body and "Looks good (0 findings)" in body and "How to test" in body
+    assert body.endswith("🤖 Generated with [Claude Code](https://claude.com/claude-code)")
+    finished = [e for e in f.store.events(task_id="t1") if e["type"] == "finished"]
+    assert finished and finished[0]["url"] == task["pr_url"]
+
+
+async def test_finish_falls_back_to_compare_url_when_gh_fails(finishing):
+    f = finishing
+    f.gh_replies["list"] = RuntimeError("To get started with GitHub CLI, please run: gh auth login")
+    wt = await f.add("t2", "agent/greet-2", spec="No verify here")
+    (wt / "app.py").write_text("changed\n", newline="")
+
+    task = await f.manager.finish("t2")
+    assert task["pr_url"] == (
+        "https://github.com/octo/demo/compare/main...agent/greet-2?expand=1&title=Change%20greeting"
+    )
+    assert task["pr_state"] == "compare" and "gh auth login" in task["finish_error"]
+    assert task["status"] == "ready" and f.pushed("agent/greet-2")
+    assert any(e["type"] == "warning" and "gh auth login" in e["message"] for e in f.store.events(task_id="t2"))
+    # The Open PR button retries gh, and without auth lands on the compare page again.
+    calls = len(f.gh_calls)
+    assert await f.manager.open_pr("t2") == task["pr_url"]
+    assert len(f.gh_calls) == calls + 1
+
+
+async def test_finish_does_not_open_duplicate_prs(finishing):
+    f = finishing
+    wt = await f.add("t3", "agent/done", pr_url="https://github.com/octo/demo/pull/1", pr_state="open")
+    (wt / "app.py").write_text("changed\n", newline="")
+    task = await f.manager.finish("t3")
+    assert task["pr_url"] == "https://github.com/octo/demo/pull/1"
+    assert f.gh_calls == [] and not f.pushed("agent/done")
+
+    # A retried task whose PR gh already knows about reuses it.
+    f.gh_replies["list"] = "https://github.com/octo/demo/pull/2"
+    wt = await f.add("t4", "agent/again", pr_url="https://github.com/octo/demo/compare/x", pr_state="compare")
+    (wt / "app.py").write_text("changed\n", newline="")
+    task = await f.manager.finish("t4")
+    assert (task["pr_url"], task["pr_state"]) == ("https://github.com/octo/demo/pull/2", "open")
+    assert not any(c[1] == "create" for c in f.gh_calls)
+
+
+async def test_finish_never_pushes_the_default_branch(finishing):
+    f = finishing
+    sh(f.repo, "git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/release")
+    wt = await f.add("t5", "release")
+    (wt / "app.py").write_text("changed\n", newline="")
+    task = await f.manager.finish("t5")
+    assert task["pr_url"] is None and "refusing to push the default branch" in task["finish_error"]
+    assert task["status"] == "ready" and not f.pushed("release") and f.gh_calls == []
+    with pytest.raises(RuntimeError, match="refusing"):
+        await f.manager.open_pr("t5")
+
+
+async def test_finish_refuses_secret_like_new_files(finishing):
+    f = finishing
+    wt = await f.add("t6", "agent/secret")
+    (wt / "app.py").write_text("changed\n", newline="")
+    (wt / "config").mkdir()
+    (wt / "config" / ".env").write_text("TOKEN=x\n")
+    task = await f.manager.finish("t6")
+    assert task["pr_url"] is None and "config/.env" in task["finish_error"]
+    assert not f.pushed("agent/secret") and (await gitops.head_sha(wt)) == task["base_sha"]  # nothing committed
+
+
+async def test_finish_needs_an_origin_remote(finishing):
+    f = finishing
+    sh(f.repo, "git", "remote", "remove", "origin")
+    wt = await f.add("t7", "agent/no-origin")
+    (wt / "app.py").write_text("changed\n", newline="")
+    task = await f.manager.finish("t7")
+    assert "no 'origin' remote" in task["finish_error"]
+
+
+async def test_concurrent_finish_runs_open_one_pr(finishing, monkeypatch):
+    from personal_agent import tasks as tasks_mod
+
+    f = finishing
+    created = []
+
+    async def slow_gh(cwd, *args):
+        await asyncio.sleep(0.05)
+        if args[1] == "list":
+            return created[-1] if created else ""
+        created.append("https://github.com/octo/demo/pull/9")
+        return created[-1]
+
+    monkeypatch.setattr(tasks_mod, "_gh", slow_gh)
+    wt = await f.add("t8", "agent/twice")
+    (wt / "app.py").write_text("changed\n", newline="")
+    first, second = await asyncio.gather(f.manager.open_pr("t8"), f.manager.open_pr("t8"))
+    assert first == second == "https://github.com/octo/demo/pull/9" and len(created) == 1
+    task = f.store.task("t8")
+    assert (task["pr_state"], task["finish_error"]) == ("open", None)
+
+
+async def test_open_pr_with_open_findings_is_a_draft_listing_them(finishing):
+    f = finishing
+    wt = await f.add("t9", "agent/draft")
+    (wt / "app.py").write_text("changed\n", newline="")
+    f.store.save_review("r@t9", {"verdict": "changes_requested", "summary": "Not yet", "findings": [
+        {"severity": "blocking", "file": "app.py", "line": 1, "title": "Breaks hello", "detail": "returns wrong"},
+    ]})
+    await f.manager.open_pr("t9")
+    create = next(c for c in f.gh_calls if c[1] == "create")
+    assert "--draft" in create
+    body = create[create.index("--body") + 1]
+    assert "still has open findings" in body and "[blocking] app.py:1 Breaks hello" in body
+
+
+async def test_merge_and_discard_wait_for_a_running_finish(finishing, monkeypatch):
+    from personal_agent import tasks as tasks_mod
+
+    f = finishing
+    order = []
+
+    async def slow_gh(cwd, *args):
+        await asyncio.sleep(0.1)
+        order.append(f"gh {args[1]}")
+        return "" if args[1] == "list" else "https://github.com/octo/demo/pull/3"
+
+    monkeypatch.setattr(tasks_mod, "_gh", slow_gh)
+    for task_id, branch in (("m", "agent/merge-me"), ("d", "agent/discard-me")):
+        wt = await f.add(task_id, branch)
+        (wt / "app.py").write_text("changed\n", newline="")
+    finishing_m = asyncio.create_task(f.manager.open_pr("m"))
+    finishing_d = asyncio.create_task(f.manager.open_pr("d"))
+    await asyncio.sleep(0.01)
+    await asyncio.gather(f.manager.merge("m", None), f.manager.discard("d"))
+    await asyncio.gather(finishing_m, finishing_d)
+    for task_id, status in (("m", "merged"), ("d", "discarded")):
+        task = f.store.task(task_id)
+        assert task["status"] == status and task["pr_url"] == "https://github.com/octo/demo/pull/3", task_id
+    assert order.count("gh create") == 2
+
+
+async def test_finish_after_merge_does_nothing(finishing):
+    f = finishing
+    wt = await f.add("t10", "agent/late")
+    (wt / "app.py").write_text("changed\n", newline="")
+    await f.manager.merge("t10", "Merge it")
+    task = await f.manager.finish("t10")
+    assert "was merged" in task["finish_error"] and f.gh_calls == [] and not f.pushed("agent/late")
+
+
+async def test_default_branch_detection(tmp_path, repo):
+    assert await gitops.default_branch(repo) == "main"  # no origin at all: fall back
+    sh(repo, "git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+    assert await gitops.default_branch(repo) == "trunk"
+
+    # A repo that was git init'ed and pushed has no origin/HEAD: ask origin.
+    local = tmp_path / "local"
+    local.mkdir()
+    bare = tmp_path / "remote.git"
+    sh(tmp_path, "git", "init", "-q", "--bare", "-b", "develop", str(bare))
+    sh(local, "git", "init", "-q", "-b", "develop")
+    sh(local, "git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init")
+    sh(local, "git", "remote", "add", "origin", str(bare))
+    sh(local, "git", "push", "-q", "-u", "origin", "develop")
+    assert await gitops.default_branch(local) == "develop"
+
+    # Origin unreachable: a pushed master still beats the 'main' guess.
+    sh(local, "git", "branch", "-q", "-m", "develop", "master")
+    sh(local, "git", "push", "-q", "-u", "origin", "master")
+    sh(local, "git", "update-ref", "-d", "refs/remotes/origin/develop")
+    sh(local, "git", "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    assert await gitops.default_branch(local) == "master"
+
+
+@pytest.mark.parametrize("url, expected", [
+    ("https://github.com/octo/demo.git", ("octo", "demo")),
+    ("https://github.com/octo/demo", ("octo", "demo")),
+    ("https://user:token@github.com/octo/demo.git/", ("octo", "demo")),
+    ("git@github.com:octo/my.repo.git", ("octo", "my.repo")),
+    ("ssh://git@github.com/octo/demo.git", ("octo", "demo")),
+    ("ssh://git@github.com:22/octo/demo", ("octo", "demo")),
+    ("https://gitlab.com/octo/demo.git", None),
+    ("C:/repos/origin.git", None),
+])
+def test_github_repo_from_remote_url(url, expected):
+    assert gitops.github_repo(url) == expected
+
+
 # origin checks and self-change detection
 
 def test_same_origin():
@@ -657,6 +902,11 @@ def _resume_manager(tmp_path, monkeypatch, fail_resume=False):
     store = Store(tmp_path / "t.db")
     manager = tasks_mod.TaskManager(Config(repos=[Repo(name="r", path=tmp_path, access=Access.WRITE)]), store, Bus())
 
+    async def no_finish(task_id):
+        return {}
+
+    monkeypatch.setattr(manager, "_finish", no_finish)  # these worktrees are not git checkouts
+
     def add(task_id: str, worktree: bool = True, **fields) -> None:
         wt = tmp_path / "wt" / task_id
         if worktree:
@@ -691,6 +941,47 @@ async def test_recover_resumes_active_tasks_with_their_session(tmp_path, monkeyp
     assert store.task("rev")["review_rounds"] == 2  # the interrupted round, not round 1 again
     assert store.task("fix")["review_rounds"] == 2  # the fix is followed by the next review
     assert store.task("impl")["session_id"] == "new-session"
+
+
+async def test_ready_task_is_finished_with_a_pr(tmp_path, monkeypatch):
+    manager, store, runs, add, settle = _resume_manager(tmp_path, monkeypatch)
+    seen = []
+
+    async def finish(task_id):
+        seen.append(store.task(task_id)["status"])  # already ready, so a restart now does not rerun the review
+        return {"pr_url": "https://github.com/o/r/pull/1", "pr_state": "open", "finish_error": None}
+
+    monkeypatch.setattr(manager, "_finish", finish)
+    add("t", status="reviewing", phase="reviewing", review_rounds=1)
+    manager.recover()
+    await settle()
+    task = store.task("t")
+    assert seen == ["ready"] and task["status"] == "ready" and task["pr_url"] == "https://github.com/o/r/pull/1"
+
+
+async def test_no_automatic_pr_while_the_final_review_has_open_findings(tmp_path, monkeypatch):
+    from personal_agent import tasks as tasks_mod
+
+    manager, store, runs, add, settle = _resume_manager(tmp_path, monkeypatch)
+    finished = []
+
+    async def finish(task_id):
+        finished.append(task_id)
+        return {}
+
+    async def still_blocking(ws, config, store, bus):
+        return {"verdict": "changes_requested", "summary": "no", "findings": [
+            {"severity": "blocking", "file": "a.py", "line": 1, "title": "t", "detail": "d"},
+        ]}
+
+    monkeypatch.setattr(manager, "_finish", finish)
+    monkeypatch.setattr(tasks_mod, "review_workspace", still_blocking)
+    add("t", status="reviewing", phase="reviewing", review_rounds=tasks_mod.MAX_FIX_ROUNDS + 1)
+    manager.recover()
+    await settle()
+    task = store.task("t")
+    assert finished == [] and task["status"] == "ready" and task["pr_url"] is None
+    assert "open findings" in task["finish_error"]
 
 
 async def test_recover_skips_missing_worktrees_and_finished_tasks(tmp_path, monkeypatch):

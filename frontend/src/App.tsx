@@ -10,7 +10,7 @@ import { EditorArea } from './components/EditorArea'
 import { FileTree } from './components/FileTree'
 import { QuickOpen } from './components/QuickOpen'
 import { SearchPanel } from './components/SearchPanel'
-import { ACTIVE_STATUSES, TasksPanel } from './components/TasksPanel'
+import { ACTIVE_STATUSES, TasksPanel, useTaskNotices } from './components/TasksPanel'
 import { TopBar } from './components/TopBar'
 import { connect } from './socket'
 import { useApp } from './store'
@@ -61,6 +61,7 @@ function Sidebar({ tabs }: { tabs: SideTab[] }) {
   const activeTasks = useApp(
     (s) => s.tasks.filter((t) => t.repo === s.workspace?.repo && ACTIVE_STATUSES.has(t.status)).length,
   )
+  const notices = useTaskNotices().length
   const current = tabs.includes(side) ? side : tabs[0]
   const wsId = workspace ? `${workspace.repo}@${workspace.task}` : ''
 
@@ -78,6 +79,9 @@ function Sidebar({ tabs }: { tabs: SideTab[] }) {
             >
               {t.label}
               {t.id === 'tasks' && activeTasks > 0 && <span className="count">{activeTasks}</span>}
+              {t.id === 'tasks' && notices > 0 && (
+                <span className="badge" title={`${notices} finished task${notices === 1 ? '' : 's'} to look at`}>{notices}</span>
+              )}
             </button>
           ))}
         </div>
@@ -119,6 +123,7 @@ function DesktopLayout() {
 function MobileLayout() {
   const view = useApp((s) => s.mobileView)
   const approvals = useApp((s) => s.approvals.length)
+  const notices = useTaskNotices().length
   return (
     <>
       <div className="mobile-main">
@@ -139,6 +144,7 @@ function MobileLayout() {
             <Icon size={18} />
             <span>{label}</span>
             {id === 'chat' && approvals > 0 && <span className="nav-badge" />}
+            {id === 'tasks' && notices > 0 && <span className="nav-badge count-badge">{notices}</span>}
           </button>
         ))}
       </nav>

@@ -10,6 +10,7 @@ let retry = 0
 
 const PERSISTED = new Set([
   'user', 'text', 'tool', 'result', 'task_link', 'review', 'error', 'warning', 'stopped', 'resumed', 'checkpoint',
+  'finished',
 ])
 
 function append(map: Record<string, AgentEvent[]>, key: string, event: AgentEvent) {
@@ -63,7 +64,8 @@ function handle(e: ServerEvent) {
       const exists = s.tasks.some((x) => x.id === t.id)
       const before = s.tasks.find((x) => x.id === t.id)?.status
       if (before !== t.status && (t.status === 'ready' || t.status === 'failed')) {
-        notify(t.status === 'ready' ? 'Task ready for review' : 'Task failed', t.title, t.id)
+        const pr = !t.pr_url ? '' : t.pr_state === 'compare' ? '\nBranch pushed; open the compare page to create the PR.' : '\nPR opened.'
+        notify(t.status === 'ready' ? 'Task ready for review' : 'Task failed', t.title + pr, t.id)
       }
       set({ tasks: exists ? s.tasks.map((x) => (x.id === t.id ? t : x)) : [t, ...s.tasks] })
       return
