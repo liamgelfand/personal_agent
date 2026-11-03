@@ -38,6 +38,7 @@ function handle(e: ServerEvent) {
         const streaming = { ...s.streaming }
         delete streaming[conv]
         set({ busyConvs: { ...s.busyConvs, [conv]: e.busy as boolean }, streaming })
+        if (!e.busy && s.busyConvs[conv] && conv !== s.activeConv) set({ unseenConvs: { ...s.unseenConvs, [conv]: true } })
         if (!e.busy && s.busyConvs[conv]) {
           notify('Agent replied', s.conversations.find((c) => c.id === conv)?.title ?? 'Chat', conv)
         }
@@ -54,10 +55,8 @@ function handle(e: ServerEvent) {
       return
     }
     case 'conversation_deleted':
-      set({
-        conversations: s.conversations.filter((c) => c.id !== e.id),
-        activeConv: s.activeConv === e.id ? null : s.activeConv,
-      })
+      set({ conversations: s.conversations.filter((c) => c.id !== e.id) })
+      s.closeChatTab(e.id as string).catch(s.showError)
       return
     case 'task_updated': {
       const t = e.task as Task
@@ -75,6 +74,8 @@ function handle(e: ServerEvent) {
     case 'approval_request':
       if (!s.approvals.some((a) => a.id === e.id)) {
         set({ approvals: [...s.approvals, e as unknown as Approval] })
+        const from = e.conversation_id as string | undefined
+        if (from && from !== s.activeConv) set({ unseenConvs: { ...s.unseenConvs, [from]: true } })
         notify('Approval needed', `The agent wants to ${e.reason}.`, e.id as string)
       }
       return

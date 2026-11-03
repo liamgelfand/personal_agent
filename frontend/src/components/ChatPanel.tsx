@@ -7,6 +7,7 @@ import { fuzzyFilter } from '../fuzzy'
 import { send } from '../socket'
 import { useApp } from '../store'
 import type { Conversation, Mode } from '../types'
+import { ChatTabs } from './ChatTabs'
 import { EventView } from './EventList'
 import { markdownComponents } from './ExternalLink'
 
@@ -21,7 +22,7 @@ function ago(ts: number) {
 export function ChatPanel() {
   const [showHistory, setShowHistory] = useState(false)
   const activeConv = useApp((s) => s.activeConv)
-  const conv = useApp((s) => s.conversations.find((c) => c.id === s.activeConv))
+  const conv = useApp((s) => (s.activeConv ? s.convCache[s.activeConv] : undefined))
   const workspace = useApp((s) => s.workspace)
   const newConversation = useApp((s) => s.newConversation)
   const showError = useApp((s) => s.showError)
@@ -71,6 +72,7 @@ export function ChatPanel() {
           <SquarePen size={15} />
         </button>
       </div>
+      <ChatTabs onSelect={() => setShowHistory(false)} onNew={startNew} />
       {showHistory ? (
         <History onPick={() => setShowHistory(false)} />
       ) : activeConv ? (
@@ -153,7 +155,7 @@ function History({ onPick }: { onPick: () => void }) {
 }
 
 function ConversationView({ id }: { id: string }) {
-  const conv = useApp((s) => s.conversations.find((c) => c.id === id))
+  const conv = useApp((s) => s.convCache[id])
   const events = useApp((s) => s.convEvents[id])
   const streaming = useApp((s) => s.streaming[id])
   const busy = useApp((s) => !!s.busyConvs[id])
