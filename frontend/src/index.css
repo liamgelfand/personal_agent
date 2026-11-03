@@ -95,6 +95,7 @@ svg { flex-shrink: 0; }
 .spacer { flex: 1; }
 .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .error-text { color: var(--danger); }
+.warn-text { color: var(--warn); }
 .num { font-variant-numeric: tabular-nums; }
 
 /* buttons */
@@ -174,6 +175,10 @@ svg { flex-shrink: 0; }
 .side-tab.active { color: var(--text); border-bottom-color: var(--text); }
 .count { font-size: 11px; color: var(--text-3); font-variant-numeric: tabular-nums; }
 .side-tab.active .count { color: var(--text-2); }
+.badge {
+  display: inline-grid; place-items: center; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px;
+  font-size: 10.5px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--primary-text); background: var(--accent);
+}
 .panel-body { flex: 1; overflow-y: auto; min-height: 0; padding-bottom: 16px; }
 .filter { margin: 8px; width: calc(100% - 16px); }
 
@@ -236,6 +241,11 @@ svg { flex-shrink: 0; }
 .task-row .task-title { font-weight: 500; }
 .task-meta { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--text-3); font-size: 12px; }
 .task-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.notices { display: flex; flex-direction: column; gap: 8px; padding: 10px 8px; border-bottom: 1px solid var(--border); }
+.notice { border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; background: var(--surface); }
+.notice .task-title { font-weight: 500; }
+.notice-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.notice-close { margin-left: auto; width: 22px; height: 22px; flex-shrink: 0; }
 
 /* editor */
 .editor-area { height: 100%; display: flex; flex-direction: column; background: var(--surface); }
@@ -466,6 +476,10 @@ a.btn { text-decoration: none; }
 .mobile-nav button { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; height: 56px; font-size: 11px; color: var(--text-3); position: relative; }
 .mobile-nav button.active { color: var(--text); }
 .nav-badge { position: absolute; top: 9px; left: calc(50% + 8px); width: 7px; height: 7px; border-radius: 50%; background: var(--warn); }
+.nav-badge.count-badge {
+  top: 5px; width: auto; min-width: 15px; height: 15px; padding: 0 4px; border-radius: 8px; background: var(--accent);
+  color: var(--primary-text); font-size: 10px; font-weight: 600; line-height: 15px; text-align: center;
+}
 .ide.mobile .composer textarea { font-size: 16px; } /* 16px stops iOS zooming into the field */
 .ide.mobile input, .ide.mobile select { font-size: 16px; }
 .ide.mobile .tree-row, .ide.mobile .change-row { height: 36px; }

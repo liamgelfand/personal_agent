@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { api, ApiError } from './api'
 import * as chatTabList from './chatTabs'
+import { pruneDismissed } from './taskNotices'
 import type {
   AdminState, AgentEvent, Approval, Conversation, MobileView, Mode, Repo, Review, SideTab, Tab, Task, UsageWindow,
   WorkspaceRef,
@@ -11,12 +12,21 @@ const mobileQuery = window.matchMedia('(max-width: 820px)')
 mobileQuery.addEventListener('change', (e) => useApp.setState({ isMobile: e.matches }))
 
 const CHAT_TABS_KEY = 'chatTabs'
+const DISMISSED_TASKS_KEY = 'dismissedTasks'
 
 function loadChatTabs(): { ids?: unknown; active?: unknown } {
   try {
     return JSON.parse(localStorage.getItem(CHAT_TABS_KEY) ?? '{}') ?? {}
   } catch {
     return {}
+  }
+}
+
+function loadDismissedTasks(): string[] {
+  try {
+    return pruneDismissed(JSON.parse(localStorage.getItem(DISMISSED_TASKS_KEY) ?? '[]'))
+  } catch {
+    return []
   }
 }
 
@@ -64,6 +74,8 @@ type State = {
 
   tasks: Task[]
   taskEvents: Record<string, AgentEvent[]>
+  // Finished tasks whose notification card was dismissed (see taskNotices.ts).
+  dismissedTasks: string[]
 
   approvals: Approval[]
   windows: Record<string, UsageWindow>
@@ -93,6 +105,7 @@ type State = {
   newConversation: (repo: string | null, mode?: Mode) => Promise<void>
   refreshConversations: (q?: string) => Promise<void>
   refreshTasks: () => Promise<void>
+  dismissTask: (id: string) => void
   openTab: (tab: Tab) => void
   closeTab: (id: string) => void
   setDirty: (id: string, dirty: boolean) => void
@@ -114,6 +127,7 @@ export const useApp = create<State>((set, get) => ({
   convCache: {},
   tasks: [],
   taskEvents: {},
+  dismissedTasks: loadDismissedTasks(),
   approvals: [],
   windows: {},
   fsVersion: {},
@@ -215,6 +229,10 @@ export const useApp = create<State>((set, get) => ({
     set({ tasks: await api.tasks() })
   },
 
+  dismissTask(id) {
+    set((s) => ({ dismissedTasks: pruneDismissed([...s.dismissedTasks, id]) }))
+  },
+
   openTab(tab) {
     set((s) => {
       const existing = s.tabs.findIndex((t) => t.id === tab.id)
@@ -263,6 +281,9 @@ useApp.subscribe((s, prev) => {
   }
   if (s.chatTabs !== prev.chatTabs || s.activeConv !== prev.activeConv) {
     localStorage.setItem(CHAT_TABS_KEY, JSON.stringify({ ids: s.chatTabs, active: s.activeConv }))
+  }
+  if (s.dismissedTasks !== prev.dismissedTasks) {
+    localStorage.setItem(DISMISSED_TASKS_KEY, JSON.stringify(s.dismissedTasks))
   }
 })
 

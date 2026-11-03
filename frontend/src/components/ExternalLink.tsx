@@ -21,7 +21,25 @@ const ON_THIS_COMPUTER = ['localhost', '127.0.0.1', '[::1]'].includes(location.h
 export function openExternal(e: MouseEvent, url: string) {
   if (!ON_THIS_COMPUTER) return
   e.preventDefault()
-  api.openUrl(url).catch(() => window.open(url, '_blank', 'noopener,noreferrer'))
+  openUrl(url)
+}
+
+// For a link only known after a request: away from this computer, a tab must be opened during the
+// click itself or the browser blocks it as a pop-up, so open a blank one now and point it at the link later.
+export function reserveTab(): Window | null {
+  return ON_THIS_COMPUTER ? null : window.open('', '_blank')
+}
+
+// Open a web link from code, in the default browser where possible (or in a tab from reserveTab).
+export function openUrl(url: string, tab: Window | null = null) {
+  if (tab) {
+    tab.opener = null
+    tab.location.href = url
+  } else if (!ON_THIS_COMPUTER) {
+    window.open(url, '_blank', 'noopener,noreferrer')
+  } else {
+    api.openUrl(url).catch(() => window.open(url, '_blank', 'noopener,noreferrer'))
+  }
 }
 
 export function ExternalLink({ href, title, children }: ComponentProps<'a'> & ExtraProps) {
