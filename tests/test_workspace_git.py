@@ -75,10 +75,43 @@ async def test_worktree_lifecycle(repo, tmp_path):
     assert "agent/x" not in await gitops.git(repo, "branch")
 
 
-async def test_list_files_respects_gitignore(repo):
+async def test_list_files_includes_ignored_but_skips_heavy_dirs(repo):
     (repo / "ignored.txt").write_text("x", newline="")
     (repo / "untracked.py").write_text("x", newline="")
-    assert await list_files(ws(repo)) == [".gitignore", "a.py", "untracked.py"]
+    (repo / "node_modules" / "pkg").mkdir(parents=True)
+    (repo / "node_modules" / "pkg" / "index.js").write_text("x", newline="")
+    (repo / "tools" / "build").mkdir(parents=True)
+    (repo / "tools" / "build" / "release.py").write_text("x", newline="")
+    (repo / "tools" / "build" / "out.o").write_text("x", newline="")
+    sh(repo, "git", "add", "tools/build/release.py")
+    files = [".gitignore", "a.py", "ignored.txt", "tools/build/release.py", "untracked.py"]
+    assert await list_files(ws(repo)) == (files, False)
+
+
+async def test_list_files_reports_truncation(repo, monkeypatch):
+    from personal_agent import workspace
+
+    monkeypatch.setattr(workspace, "MAX_LIST_FILES", 1)
+    assert await list_files(ws(repo)) == ([".gitignore"], True)
+
+
+async def test_list_files_cap_keeps_non_ignored_files_over_ignored(repo, monkeypatch):
+    from personal_agent import workspace
+
+    (repo / "ignored.txt").write_text("x", newline="")  # sorts before "untracked.py" but is dropped first
+    (repo / "untracked.py").write_text("x", newline="")
+    monkeypatch.setattr(workspace, "MAX_LIST_FILES", 3)
+    assert await list_files(ws(repo)) == ([".gitignore", "a.py", "untracked.py"], True)
+
+
+async def test_worktree_git_link_file_is_hidden_and_not_writable(repo, tmp_path):
+    wt = tmp_path / "wt"
+    await gitops.add_worktree(repo, wt, "agent/x")
+    w = ws(wt)
+    assert (wt / ".git").is_file()
+    assert await list_files(w) == ([".gitignore", "a.py"], False)
+    with pytest.raises(WorkspaceError):
+        write_file(w, ".git", "gitdir: elsewhere\n")
 
 
 def test_file_access_is_confined_and_respects_access(repo):

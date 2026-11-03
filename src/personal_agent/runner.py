@@ -15,6 +15,7 @@ from claude_agent_sdk import (
     SystemMessage,
     TextBlock,
     ToolUseBlock,
+    UserMessage,
     query,
 )
 
@@ -24,7 +25,15 @@ from .store import Store
 SUMMARY_KEYS = ("command", "file_path", "path", "pattern", "query", "url", "description", "title")
 
 
-async def _messages(prompt: str, options: ClaudeAgentOptions) -> AsyncIterator[Any]:
+async def _prompt_stream(prompt: str, prompt_uuid: str) -> AsyncIterator[dict[str, Any]]:
+    # The streamed form of a string prompt, so the transcript entry gets a UUID we know.
+    yield {
+        "type": "user", "session_id": "", "uuid": prompt_uuid,
+        "message": {"role": "user", "content": prompt}, "parent_tool_use_id": None,
+    }
+
+
+async def _messages(prompt: str, options: ClaudeAgentOptions, prompt_uuid: str | None = None) -> AsyncIterator[Any]:
     """SDK messages, ending quietly after an error result.
 
     When Claude Code ends with an error result (turn limit, usage limit, API error) the SDK yields
@@ -32,7 +41,8 @@ async def _messages(prompt: str, options: ClaudeAgentOptions) -> AsyncIterator[A
     """
     got_error_result = False
     try:
-        async for message in query(prompt=prompt, options=options):
+        stream = _prompt_stream(prompt, prompt_uuid) if prompt_uuid else prompt
+        async for message in query(prompt=stream, options=options):
             if isinstance(message, ResultMessage) and message.is_error:
                 got_error_result = True
             yield message
@@ -49,25 +59,23 @@ def summarize_tool(name: str, args: dict[str, Any]) -> str:
 
 
 async def run_agent(
-    options: ClaudeAgentOptions, prompt: str, store: Store, bus: Bus, kind: str, ref: str | None
+    options: ClaudeAgentOptions, prompt: str, store: Store, bus: Bus, kind: str, ref: str | None,
+    prompt_uuid: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """Yield events: session, delta, text, tool, result. Records cost; pushes rate limits to the bus.
-
-    `session` comes once, as soon as a message carries the Claude session id, so callers can save
-    it before the run ends.
-    """
+    """Yield events: delta, text, tool, result, and session (the session ID, as soon as a main-thread
+    message reveals it, so a stopped turn still knows its session). Records cost; pushes rate limits
+    to the bus. prompt_uuid, if given, becomes the prompt's transcript UUID (for rewinding)."""
     run_id = store.start_run(kind, ref)
     result: ResultMessage | None = None
-    session_seen = False
+    session_id: str | None = None
     try:
-        async for message in _messages(prompt, options):
-            session_id = (
-                message.data.get("session_id") if isinstance(message, SystemMessage)
-                else getattr(message, "session_id", None)
-            )
-            if session_id and not session_seen:
-                session_seen = True
-                yield {"type": "session", "session_id": session_id}
+        async for message in _messages(prompt, options, prompt_uuid):
+            if (
+                isinstance(message, (AssistantMessage, UserMessage)) and not message.parent_tool_use_id
+                and (sid := getattr(message, "session_id", None)) and sid != session_id
+            ):
+                session_id = sid
+                yield {"type": "session", "session_id": sid}
             if isinstance(message, StreamEvent):
                 event = message.event
                 delta = event.get("delta", {})
