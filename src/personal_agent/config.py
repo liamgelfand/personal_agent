@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from enum import Enum
 from pathlib import Path
 from typing import Literal
@@ -10,7 +11,8 @@ import yaml
 from pydantic import BaseModel, Field, field_validator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+# PERSONAL_AGENT_CONFIG points at another config file (the tests use it when config.yaml is absent).
+CONFIG_PATH = Path(os.environ.get("PERSONAL_AGENT_CONFIG") or PROJECT_ROOT / "config.yaml")
 DATA_DIR = PROJECT_ROOT / "data"
 SCRATCH_DIR = DATA_DIR / "scratch"  # working directory for conversations with no repo
 WORKTREES_DIR = DATA_DIR / "worktrees"  # one git worktree per agent task
@@ -26,6 +28,10 @@ class Repo(BaseModel):
     path: Path
     access: Access = Access.READ
     github: str | None = None  # "owner/repo", used by the GitHub integration later
+    # Shell commands run in each new task worktree (after node_modules is linked); failures are logged, not fatal.
+    setup: list[str] = Field(default_factory=list)
+    # Commands that run the tests / type checker, told to the implementer and reviewer. Empty: detected.
+    verify: list[str] = Field(default_factory=list)
 
     @field_validator("path")
     @classmethod
@@ -62,6 +68,8 @@ class Config(BaseModel):
     repos: list[Repo] = Field(default_factory=list)
     models: Models = Field(default_factory=Models)
     max_turns: int = 60
+    # Review rounds per task. Another implement/review round only runs while blocking findings remain.
+    max_review_rounds: int = Field(2, ge=1)
     port: int = 8000
     remote: Remote = Field(default_factory=Remote)
     notifications: Notifications = Field(default_factory=Notifications)

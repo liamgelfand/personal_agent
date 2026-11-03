@@ -6,6 +6,15 @@ repos:
     path: C:/Users/you/code/my-app      # or /home/you/code/my-app
     access: write
     github: you/my-app                  # optional, owner/repo
+    # Optional. Each task gets its own git worktree; node_modules folders from the main checkout are
+    # linked into it automatically. `setup` runs extra shell commands in a new worktree (10 min limit
+    # each; a failure is logged in the task, not fatal). `verify` lists the commands that run the
+    # tests / type checker, given to the implementer and reviewer; left empty, they are detected.
+    # setup:
+    #   - uv sync
+    # verify:
+    #   - uv run pytest tests
+    #   - cd frontend && npm run typecheck
 
 models:            # aliases ("opus", "sonnet", "haiku") or full model IDs
   orchestrator: sonnet
@@ -14,6 +23,9 @@ models:            # aliases ("opus", "sonnet", "haiku") or full model IDs
   researcher: sonnet
 
 max_turns: 60
+# Review rounds per task. A fix + re-review only follows a review with blocking findings;
+# should_fix and nit findings are listed in the review without another round.
+max_review_rounds: 2
 port: 8000
 
 # subscription: always bill agent runs to your claude.ai plan (API keys in the environment are ignored)

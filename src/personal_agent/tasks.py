@@ -9,28 +9,31 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions
 
-from . import gitops
+from . import bootstrap, gitops
 from .agents import load_agent
 from .bus import Bus
 from .config import WORKTREES_DIR, Access, Config
 from .guards import approval_detail, guard_hook
-from .review import has_open_findings, review_workspace
+from .review import has_blocking_findings, review_workspace
 from .runner import run_agent
 from .store import Store
 from .workspace import get_workspace
 
-MAX_FIX_ROUNDS = 2
 IMPLEMENTER_TOOLS = ["Read", "Grep", "Glob", "Edit", "Write", "MultiEdit", "Bash", "TodoWrite"]
 ACTIVE = {"queued", "implementing", "reviewing", "fixing"}
 PHASES = {"implementing", "reviewing", "fixing"}
 MAX_RESUME_ATTEMPTS = 3
-FIX_PROMPT = "The reviewer requested changes. Fix the blocking and should_fix issues, then re-verify.\n\n"
+FIX_PROMPT = (
+    "The reviewer found blocking issues. Fix them (and the should_fix issues, if quick), then re-verify: "
+    "the relevant tests and the type check, not a full frontend build.\n\n"
+)
 RESUME_PROMPT = (
     "The server restarted while you were working. Continue where you left off; check `git status` "
     "and the files first, since your last tool call may not have completed."
@@ -52,6 +55,19 @@ def _format_findings(review: dict[str, Any]) -> str:
         if f["severity"] != "nit":
             lines.append(f"- [{f['severity']}] {f['file']}:{f['line']} {f['title']}: {f['detail']}")
     return "\n".join(lines)
+
+
+def _findings_markdown(review: dict[str, Any]) -> str:
+    return "".join(
+        f"\n- **{f['severity']}** `{f['file']}:{f['line']}` {f['title']}" for f in review.get("findings", [])
+    )
+
+
+def _duration(seconds: float, short: bool = False) -> str:
+    minutes, secs = divmod(round(seconds), 60)
+    if not minutes:
+        return f"{secs}s"
+    return f"{round(seconds / 60)}m" if short else f"{minutes}m {secs}s"
 
 
 class ResumeFailed(RuntimeError):
@@ -187,7 +203,8 @@ class TaskManager:
             raise RuntimeError("nothing committed on this branch yet")
         await gitops.git(worktree, "push", "-u", "origin", task["branch"])
         review = self.store.review(f"{task['repo']}@{task_id}")
-        body = f"{task['spec']}\n\n---\nReview: {review['summary'] if review else 'not run'}\n\n" \
+        body = f"{task['spec']}\n\n---\nReview: {review['summary'] if review else 'not run'}" \
+               f"{_findings_markdown(review) if review else ''}\n\n" \
                "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
         proc = await asyncio.create_subprocess_exec(
             "gh", "pr", "create", "--head", task["branch"], "--title", task["title"], "--body", body,
@@ -207,22 +224,27 @@ class TaskManager:
             return await self.bus.request_approval(scope, tool, approval_detail(tool, args), reason)
 
         implementer = load_agent("implementer", self.config.models.implementer)
+        prompt = implementer.prompt + "\n\n" + bootstrap.environment_section(ws.repo, ws.path, "implementer")
         return ClaudeAgentOptions(
             cwd=ws.path,
-            system_prompt={"type": "preset", "preset": "claude_code", "append": implementer.prompt},
+            system_prompt={"type": "preset", "preset": "claude_code", "append": prompt},
             model=self.config.models.implementer,
             allowed_tools=IMPLEMENTER_TOOLS,
             disallowed_tools=["PowerShell", "Agent", "Task", "WebSearch", "WebFetch"],
-            hooks={"PreToolUse": [guard_hook([ws.as_root()], ws.path, approve, self.config.auto_approve)]},
+            hooks={"PreToolUse": [
+                guard_hook([ws.as_root()], ws.path, approve, self.config.auto_approve),
+                bootstrap.dependency_link_hook(ws.path, lambda links, command: self._unlinked(ws.task_id, links, command)),
+            ]},
             setting_sources=["project"],
             max_turns=self.config.max_turns,
             resume=session_id,
         )
 
-    async def _implement(self, ws, prompt: str, session_id: str | None) -> None:
+    async def _implement(self, ws, prompt: str, session_id: str | None) -> dict[str, Any]:
         """Run the implementer, saving its session id as soon as it is known so a restart can resume it.
 
-        Raises ResumeFailed when a resumed session (`session_id` set) fails before any text or tool use.
+        Returns the run's turns and cost. Raises ResumeFailed when a resumed session (`session_id` set)
+        fails before any text or tool use.
         """
         worked = False
         try:
@@ -238,14 +260,14 @@ class TaskManager:
                     self.store.update_task(ws.task_id, session_id=event["session_id"])
                     if event["is_error"]:
                         raise RuntimeError("; ".join(event["errors"] or ["implementer failed"]))
-                    return
+                    return {"turns": event.get("num_turns"), "cost_usd": event.get("cost_usd")}
             raise RuntimeError("the implementer ended without a result")
         except Exception as exc:
             if session_id and not worked:
                 raise ResumeFailed(str(exc)) from exc
             raise
 
-    async def _resume_implementer(self, ws, session_id: str | None, fresh_prompt: str) -> None:
+    async def _resume_implementer(self, ws, session_id: str | None, fresh_prompt: str) -> dict[str, Any]:
         """After a restart: continue the saved session, or rerun the phase from `fresh_prompt`.
 
         Only a session that could not be resumed at all is rerun; a resumed session that fails
@@ -253,8 +275,7 @@ class TaskManager:
         """
         if session_id:
             try:
-                await self._implement(ws, RESUME_PROMPT, session_id)
-                return
+                return await self._implement(ws, RESUME_PROMPT, session_id)
             except ResumeFailed as exc:
                 if self.shutting_down:
                     raise
@@ -262,7 +283,47 @@ class TaskManager:
         else:
             text = "No saved session to resume, restarted phase from the spec"
         await self._emit(ws.task_id, {"type": "resumed", "agent": "pipeline", "text": text})
-        await self._implement(ws, fresh_prompt + RESTART_NOTE, None)
+        return await self._implement(ws, fresh_prompt + RESTART_NOTE, None)
+
+    async def _bootstrap(self, ws) -> None:
+        """Prepare a new worktree: link node_modules from the main checkout, run the repo's setup.
+
+        Nothing here fails the task; problems are logged and the implementer copes as before.
+        """
+        try:
+            if linked := await gitops.link_dependencies(ws.repo.path, ws.path):
+                text = "Linked from the main checkout: " + ", ".join(linked)
+                await self._emit(ws.task_id, {"type": "text", "agent": "pipeline", "text": text})
+        except (OSError, gitops.GitError) as exc:
+            await self._emit(ws.task_id, {"type": "warning", "message": f"Could not link node_modules: {exc}"})
+        for failure in await bootstrap.run_setup(ws.repo.setup, ws.path):
+            await self._emit(ws.task_id, {"type": "warning", "message": f"Setup command failed (continuing): {failure}"})
+
+    async def _unlinked(self, task_id: str, links: list[str], command: str) -> None:
+        text = f"Replaced the shared {', '.join(links)} with the worktree's own before `{command[:200]}`"
+        await self._emit(task_id, {"type": "text", "agent": "pipeline", "text": text})
+
+    async def _record_phase(
+        self, task_id: str, phase: str, round_no: int | None, started: float, stats: dict[str, Any] | None = None,
+    ) -> None:
+        ended = time.time()
+        stats = stats or {}
+        seconds = round(ended - started, 1)
+        parts = [f"{phase.capitalize()}{f' {round_no}' if round_no else ''} took {_duration(seconds)}"]
+        if stats.get("turns"):
+            parts.append(f"{stats['turns']} turns")
+        if stats.get("cost_usd") is not None:
+            parts.append(f"${stats['cost_usd']:.2f} API-equivalent")
+        await self._emit(task_id, {
+            "type": "phase", "agent": "pipeline", "phase": phase, "round": round_no, "started_at": started,
+            "ended_at": ended, "seconds": seconds, "turns": stats.get("turns"), "cost_usd": stats.get("cost_usd"),
+            "text": " · ".join(parts),
+        })
+
+    def _timing_summary(self, task_id: str) -> str:
+        """e.g. "bootstrap 4s, implement 9m, review 5m", from every phase event (across restarts too)."""
+        phases = [e for e in self.store.events(task_id=task_id) if e["type"] == "phase"]
+        return ", ".join(f"{e['phase']} {_duration(e['seconds'], short=True)}" for e in phases)
 
     async def _pipeline(self, task_id: str, resume: bool = False) -> None:
         task = self.store.task(task_id)
@@ -276,36 +337,58 @@ class TaskManager:
             # The phase to pick up after a restart; None once it has been resumed (or on a fresh run).
             resume_phase = None
             start_round = 0
+            max_rounds = self.config.max_review_rounds
             if resume:
                 resume_phase = task["phase"] or (task["status"] if task["status"] in PHASES else "implementing")
-                start_round = max(task["review_rounds"] - 1, 0)
+                start_round = min(max(task["review_rounds"] - 1, 0), max_rounds - 1)
                 await self._emit(task_id, {"type": "resumed", "agent": "pipeline", "phase": resume_phase,
                                            "text": f"Resumed after server restart ({resume_phase})"})
+            # Normally done once on a fresh run; also redone if a restart cut it short (it is idempotent).
+            if not any(e["type"] == "phase" and e["phase"] == "bootstrap" for e in self.store.events(task_id=task_id)):
+                started = time.time()
+                await self._bootstrap(ws)
+                await self._record_phase(task_id, "bootstrap", None, started)
             if resume_phase in (None, "implementing"):
                 await self._publish_task(task_id, status="implementing", phase="implementing")
+                started = time.time()
                 if resume_phase:
-                    await self._resume_implementer(ws, task["session_id"], spec_prompt)
+                    stats = await self._resume_implementer(ws, task["session_id"], spec_prompt)
                 else:
-                    await self._implement(ws, spec_prompt, None)
+                    stats = await self._implement(ws, spec_prompt, None)
+                await self._record_phase(task_id, "implement", None, started, stats)
                 resume_phase = None
-            for round_no in range(start_round, MAX_FIX_ROUNDS + 1):
+            # Another fix + review round only follows blocking findings, up to max_review_rounds reviews.
+            for round_no in range(start_round, max_rounds):
                 if resume_phase != "fixing":  # reviews are read-only, so a resumed one just reruns
                     await self._publish_task(task_id, status="reviewing", phase="reviewing", review_rounds=round_no + 1)
                     await self._emit(task_id, {"type": "text", "agent": "pipeline", "text": f"Review round {round_no + 1}"})
-                    review = await review_workspace(ws, self.config, self.store, self.bus)
+                    started, stats = time.time(), {}
+                    review = await review_workspace(ws, self.config, self.store, self.bus, stats=stats)
                     if self.shutting_down:  # an interrupted review is no verdict; rerun it on the next start
                         return
                     await self._emit(task_id, {"type": "review", "agent": "reviewer", "review": review})
-                    if not has_open_findings(review) or round_no == MAX_FIX_ROUNDS:
+                    await self._record_phase(task_id, "review", round_no + 1, started, stats)
+                    if not has_blocking_findings(review):
+                        break
+                    if round_no == max_rounds - 1:
+                        blocking = [f for f in review["findings"] if f["severity"] == "blocking"]
+                        await self._emit(task_id, {"type": "warning", "message": (
+                            f"Review limit reached ({max_rounds} rounds) with {len(blocking)} blocking finding(s) "
+                            "still open: " + "; ".join(f"{f['file']}:{f['line']} {f['title']}" for f in blocking)
+                        )})
                         break
                 await self._publish_task(task_id, status="fixing", phase="fixing")
+                started = time.time()
                 if resume_phase == "fixing":
                     findings = _format_findings(self.store.review(ws.key) or {})
-                    await self._resume_implementer(ws, task["session_id"], f"{spec_prompt}\n\n{FIX_PROMPT}{findings}")
+                    stats = await self._resume_implementer(ws, task["session_id"], f"{spec_prompt}\n\n{FIX_PROMPT}{findings}")
                 else:
-                    await self._implement(ws, FIX_PROMPT + _format_findings(review), self.store.task(task_id)["session_id"])
+                    stats = await self._implement(ws, FIX_PROMPT + _format_findings(review), self.store.task(task_id)["session_id"])
+                await self._record_phase(task_id, "fix", round_no + 1, started, stats)
                 resume_phase = None
-            await self._publish_task(task_id, status="ready")
+            summary = self._timing_summary(task_id)
+            await self._emit(task_id, {"type": "timing", "agent": "pipeline", "text": f"Finished: {summary}", "summary": summary})
+            await self._publish_task(task_id, status="ready", timing=summary)
         except asyncio.CancelledError:
             # Stop and discard are user actions; any other cancellation is the server shutting down,
             # which leaves the task active so the next start resumes it.

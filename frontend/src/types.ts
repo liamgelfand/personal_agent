@@ -33,6 +33,7 @@ export type Task = {
   review_rounds: number
   pr_url: string | null
   error: string | null
+  timing: string | null // per-phase durations once finished, e.g. "implement 9m, review 5m"
   created_at: number
   updated_at: number
 }
@@ -64,6 +65,8 @@ export type AgentEvent =
   | { type: 'warning'; message: string }
   | { type: 'stopped' }
   | { type: 'resumed'; text: string }
+  | { type: 'phase'; text: string; phase: string; seconds: number }
+  | { type: 'timing'; text: string; summary: string }
   | { type: 'checkpoint'; id: string; files: string[]; restored?: boolean }
 
 export type FileStatus = {

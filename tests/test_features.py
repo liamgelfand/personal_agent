@@ -649,7 +649,7 @@ def _resume_manager(tmp_path, monkeypatch, fail_resume=False):
         yield {"type": "session", "session_id": "new-session"}
         yield {"type": "result", "is_error": False, "errors": None, "session_id": "new-session"}
 
-    async def fake_review(ws, config, store, bus):
+    async def fake_review(ws, config, store, bus, stats=None):
         return {"verdict": "approve", "summary": "ok", "findings": []}
 
     monkeypatch.setattr(tasks_mod, "run_agent", fake_run_agent)
@@ -795,7 +795,7 @@ async def test_agents_dying_with_the_server_leave_tasks_resumable(tmp_path, monk
             raise RuntimeError("Command failed with exit code 3221225786")  # the child got Ctrl+C
         # otherwise the stream just ends with no result
 
-    async def interrupted_review(ws, config, store, bus):
+    async def interrupted_review(ws, config, store, bus, stats=None):
         return {"verdict": "changes_requested", "summary": "Review was interrupted.", "findings": []}
 
     monkeypatch.setattr(tasks_mod, "run_agent", dies_on_shutdown)

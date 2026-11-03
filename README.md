@@ -5,8 +5,10 @@ Built on the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overvi
 runs on your Claude subscription login (Pro or Max), so it costs nothing beyond your plan.
 
 - **Orchestrator** chats with you, answers questions, makes small edits, and starts tasks.
-- **Tasks** run a fixed pipeline in an isolated git worktree: implementer, then reviewer, then
-  fixes (up to two rounds). Changes stay uncommitted so you review the diff and commit yourself.
+- **Tasks** run a fixed pipeline in an isolated git worktree: implementer, then reviewer, then a
+  fix and re-review only while blocking findings remain (`max_review_rounds`, default 2). The
+  worktree shares the main checkout's `node_modules`. Changes stay uncommitted so you review the
+  diff and commit yourself.
 - **Reviewer** checks any uncommitted changes on request and pins its findings to diff lines.
 - **Researcher** answers questions from the web and library docs.
 
@@ -144,4 +146,8 @@ gitignored along with `config.yaml` and `.env`.
 
 ```sh
 python -m uv run pytest
+cd frontend && npm run typecheck   # seconds; `npm run build` takes minutes
 ```
+
+The tests run without a `config.yaml` (they use an empty one); set `PERSONAL_AGENT_CONFIG` to
+point the app at a config file somewhere else.

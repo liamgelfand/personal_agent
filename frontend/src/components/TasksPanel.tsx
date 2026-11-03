@@ -79,6 +79,7 @@ export function TasksPanel({ repo }: { repo: string }) {
               <span className="ellipsis mono" title={t.branch}>{t.branch}</span>
             </div>
             {t.error && <div className="error-text small">{t.error}</div>}
+            {t.timing && <div className="faint small" title="Time per phase">{t.timing}</div>}
             <div className="task-actions">
               <button className="btn sm" onClick={() => openTab({ id: tabId.task(t.id), kind: 'task', taskId: t.id })}>
                 Log
