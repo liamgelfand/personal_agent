@@ -9,7 +9,7 @@ let socket: WebSocket | null = null
 let retry = 0
 
 const PERSISTED = new Set([
-  'user', 'text', 'tool', 'result', 'task_link', 'review', 'error', 'warning', 'stopped', 'checkpoint',
+  'user', 'text', 'tool', 'result', 'task_link', 'review', 'error', 'warning', 'stopped', 'resumed', 'checkpoint',
 ])
 
 function append(map: Record<string, AgentEvent[]>, key: string, event: AgentEvent) {

@@ -12,6 +12,7 @@ from claude_agent_sdk import (
     ResultError,
     ResultMessage,
     StreamEvent,
+    SystemMessage,
     TextBlock,
     ToolUseBlock,
     UserMessage,

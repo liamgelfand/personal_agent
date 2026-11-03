@@ -629,3 +629,248 @@ async def test_edit_skips_undone_turns_and_warns_on_failure(chat, repo, monkeypa
     assert (repo / "new.py").read_text() == "recreated\n"  # the undone turn is not restored again
     assert [t for t, _ in transcript(store, conv_id)] == ["user", "warning", "text"]
     assert "file is locked" in transcript(store, conv_id)[1][1]
+
+
+# resuming tasks after a server restart
+
+def _resume_manager(tmp_path, monkeypatch, fail_resume=False):
+    import asyncio
+
+    from personal_agent import tasks as tasks_mod
+    from personal_agent.bus import Bus
+    from personal_agent.config import Config
+
+    runs: list[dict] = []
+
+    async def fake_run_agent(options, prompt, store, bus, kind, ref):
+        runs.append({"resume": options.resume, "prompt": prompt})
+        if options.resume and fail_resume:
+            raise RuntimeError("No conversation found")
+        yield {"type": "session", "session_id": "new-session"}
+        yield {"type": "result", "is_error": False, "errors": None, "session_id": "new-session"}
+
+    async def fake_review(ws, config, store, bus):
+        return {"verdict": "approve", "summary": "ok", "findings": []}
+
+    monkeypatch.setattr(tasks_mod, "run_agent", fake_run_agent)
+    monkeypatch.setattr(tasks_mod, "review_workspace", fake_review)
+    store = Store(tmp_path / "t.db")
+    manager = tasks_mod.TaskManager(Config(repos=[Repo(name="r", path=tmp_path, access=Access.WRITE)]), store, Bus())
+
+    def add(task_id: str, worktree: bool = True, **fields) -> None:
+        wt = tmp_path / "wt" / task_id
+        if worktree:
+            wt.mkdir(parents=True)
+        store.create_task(id=task_id, conversation_id=None, repo="r", title=task_id, spec="the spec",
+                          branch=f"agent/{task_id}", base_sha="abc", worktree=str(wt))
+        store.update_task(task_id, **fields)
+
+    async def settle() -> None:
+        await asyncio.gather(*manager.running.values())
+
+    return manager, store, runs, add, settle
+
+
+async def test_recover_resumes_active_tasks_with_their_session(tmp_path, monkeypatch):
+    manager, store, runs, add, settle = _resume_manager(tmp_path, monkeypatch)
+    add("impl", status="implementing", phase="implementing", session_id="s-impl")
+    add("rev", status="reviewing", phase="reviewing", review_rounds=2, session_id="s-rev")
+    add("fix", status="fixing", phase="fixing", review_rounds=1, session_id="s-fix")
+    manager.recover()
+    assert set(manager.running) == {"impl", "rev", "fix"}
+    await settle()
+
+    assert [r["resume"] for r in runs].count("s-impl") == 1
+    assert [r["resume"] for r in runs].count("s-fix") == 1
+    assert "s-rev" not in [r["resume"] for r in runs]  # a review is rerun, not resumed
+    assert all("server restarted" in r["prompt"] for r in runs)
+    for task_id in ("impl", "rev", "fix"):
+        task = store.task(task_id)
+        assert task["status"] == "ready" and task["resume_attempts"] == 1
+        assert any(e["type"] == "resumed" for e in store.events(task_id=task_id))
+    assert store.task("rev")["review_rounds"] == 2  # the interrupted round, not round 1 again
+    assert store.task("fix")["review_rounds"] == 2  # the fix is followed by the next review
+    assert store.task("impl")["session_id"] == "new-session"
+
+
+async def test_recover_skips_missing_worktrees_and_finished_tasks(tmp_path, monkeypatch):
+    manager, store, runs, add, settle = _resume_manager(tmp_path, monkeypatch)
+    add("gone", worktree=False, status="implementing", session_id="s")
+    add("stopped", status="stopped", session_id="s")
+    add("discarded", status="discarded", session_id="s")
+    add("merged", status="merged", session_id="s")
+    manager.recover()
+    assert manager.running == {}
+    assert store.task("gone")["status"] == "stopped"
+    assert [store.task(t)["status"] for t in ("stopped", "discarded", "merged")] == ["stopped", "discarded", "merged"]
+
+
+async def test_recover_gives_up_after_the_attempt_limit(tmp_path, monkeypatch):
+    from personal_agent.tasks import MAX_RESUME_ATTEMPTS
+
+    manager, store, runs, add, settle = _resume_manager(tmp_path, monkeypatch)
+    add("loop", status="implementing", session_id="s", resume_attempts=MAX_RESUME_ATTEMPTS)
+    manager.recover()
+    assert manager.running == {} and runs == []
+    task = store.task("loop")
+    assert task["status"] == "failed" and "gave up resuming" in task["error"]
+
+
+async def test_recover_restarts_phase_when_resume_fails_or_no_session(tmp_path, monkeypatch):
+    manager, store, runs, add, settle = _resume_manager(tmp_path, monkeypatch, fail_resume=True)
+    add("broken", status="implementing", phase="implementing", session_id="missing")
+    add("early", status="implementing", phase="implementing")
+    manager.recover()
+    await settle()
+
+    assert [r["resume"] for r in runs].count("missing") == 1
+    fresh = [r for r in runs if r["resume"] is None]
+    assert len(fresh) == 2 and all("the spec" in r["prompt"] and "keep what is good" in r["prompt"] for r in fresh)
+    assert store.task("broken")["status"] == "ready" and store.task("early")["status"] == "ready"
+    texts = [e.get("text", "") for e in store.events(task_id="broken") if e["type"] == "resumed"]
+    assert any(t.startswith("Could not resume session, restarted phase") for t in texts)
+
+
+async def test_stop_marks_resumed_task_stopped_but_shutdown_does_not(tmp_path, monkeypatch):
+    import asyncio
+
+    from personal_agent import tasks as tasks_mod
+
+    manager, store, runs, add, settle = _resume_manager(tmp_path, monkeypatch)
+
+    async def hanging_run_agent(options, prompt, store, bus, kind, ref):
+        yield {"type": "session", "session_id": "live"}
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(tasks_mod, "run_agent", hanging_run_agent)
+    add("a", status="implementing", session_id="s")
+    add("b", status="implementing", session_id="s")
+    manager.recover()
+    await asyncio.sleep(0.05)
+    assert store.task("a")["session_id"] == "live"  # saved before the run ends
+
+    assert manager.stop("a")
+    await asyncio.sleep(0)
+    await manager.shutdown()
+    assert manager.running == {}
+    assert store.task("a")["status"] == "stopped"
+    assert store.task("b")["status"] == "implementing"  # still resumable on the next start
+
+
+async def test_failure_after_a_successful_resume_fails_the_task(tmp_path, monkeypatch):
+    from personal_agent import tasks as tasks_mod
+
+    manager, store, runs, add, settle = _resume_manager(tmp_path, monkeypatch)
+
+    async def worked_then_failed(options, prompt, store, bus, kind, ref):
+        runs.append({"resume": options.resume, "prompt": prompt})
+        yield {"type": "session", "session_id": "s"}
+        yield {"type": "tool", "agent": "main", "name": "Edit", "summary": "app.py", "subagent": None}
+        yield {"type": "result", "is_error": True, "errors": ["error_max_turns"], "session_id": "s"}
+
+    monkeypatch.setattr(tasks_mod, "run_agent", worked_then_failed)
+    add("t", status="implementing", phase="implementing", session_id="s")
+    manager.recover()
+    await settle()
+    assert len(runs) == 1  # no fresh rerun of the phase
+    task = store.task("t")
+    assert task["status"] == "failed" and "error_max_turns" in task["error"]
+    assert not any(e.get("text", "").startswith("Could not resume") for e in store.events(task_id="t"))
+
+
+async def test_agents_dying_with_the_server_leave_tasks_resumable(tmp_path, monkeypatch):
+    import asyncio
+
+    from personal_agent import tasks as tasks_mod
+
+    manager, store, runs, add, settle = _resume_manager(tmp_path, monkeypatch)
+    started = asyncio.Event()
+    die = asyncio.Event()
+
+    async def dies_on_shutdown(options, prompt, store, bus, kind, ref):
+        yield {"type": "tool", "agent": "main", "name": "Bash", "summary": "pytest", "subagent": None}
+        started.set()
+        await die.wait()
+        if "crash" in str(options.cwd):
+            raise RuntimeError("Command failed with exit code 3221225786")  # the child got Ctrl+C
+        # otherwise the stream just ends with no result
+
+    async def interrupted_review(ws, config, store, bus):
+        return {"verdict": "changes_requested", "summary": "Review was interrupted.", "findings": []}
+
+    monkeypatch.setattr(tasks_mod, "run_agent", dies_on_shutdown)
+    monkeypatch.setattr(tasks_mod, "review_workspace", interrupted_review)
+    add("crash", status="implementing", phase="implementing")
+    add("ends", status="implementing", phase="implementing")
+    manager.recover()
+    await started.wait()
+    manager.shutting_down = True  # the signal handler runs before the children's exit is seen
+    die.set()
+    await settle()
+    for task_id in ("crash", "ends"):
+        assert store.task(task_id)["status"] == "implementing", task_id
+        assert not any(e["type"] in ("error", "review") for e in store.events(task_id=task_id))
+
+
+async def test_implementer_ending_without_a_result_is_an_error(tmp_path, monkeypatch):
+    from personal_agent import tasks as tasks_mod
+
+    manager, store, runs, add, settle = _resume_manager(tmp_path, monkeypatch)
+
+    async def no_result(options, prompt, store, bus, kind, ref):
+        yield {"type": "text", "agent": "main", "text": "working"}
+
+    monkeypatch.setattr(tasks_mod, "run_agent", no_result)
+    add("t", status="implementing", phase="implementing")
+    manager.recover()
+    await settle()
+    task = store.task("t")
+    assert task["status"] == "failed" and "without a result" in task["error"]
+
+
+def test_shutdown_signal_flags_tasks_before_uvicorn_handles_it():
+    import signal
+
+    from personal_agent import server
+
+    seen = []
+    saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        for sig in saved:
+            signal.signal(sig, lambda signum, frame: seen.append(signum))  # stands in for uvicorn's handler
+        server.flag_shutdown_on_signals()
+        signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+        assert server.tasks.shutting_down and seen == [signal.SIGINT]
+    finally:
+        server.tasks.shutting_down = False
+        for sig, handler in saved.items():
+            signal.signal(sig, handler)
+
+
+@pytest.mark.parametrize("endpoint", ["admin_shutdown", "admin_restart"])
+async def test_admin_exit_ends_task_pipelines_first(monkeypatch, endpoint):
+    import asyncio
+
+    from personal_agent import server
+
+    order = []
+
+    async def pipeline():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            order.append("pipeline ended")
+
+    async def exit_soon():
+        order.append("exit scheduled")
+
+    monkeypatch.setattr(server.admin, "shutdown", exit_soon)
+    monkeypatch.setattr(server.admin, "restart", exit_soon)
+    monkeypatch.setenv("PA_SUPERVISED", "1")
+    monkeypatch.setattr(server.tasks, "running", {"t": asyncio.create_task(pipeline())})
+    try:
+        await asyncio.sleep(0)
+        await getattr(server, endpoint)(force=True)
+        assert order == ["pipeline ended", "exit scheduled"]
+    finally:
+        server.tasks.shutting_down = False

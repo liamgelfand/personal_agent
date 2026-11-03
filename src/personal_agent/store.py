@@ -41,8 +41,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     branch TEXT NOT NULL,
     base_sha TEXT NOT NULL,
     worktree TEXT NOT NULL,
-    status TEXT NOT NULL,      -- queued, implementing, reviewing, ready, failed, stopped, discarded
+    status TEXT NOT NULL,      -- queued, implementing, reviewing, fixing, ready, failed, stopped, discarded, merged
     review_rounds INTEGER NOT NULL DEFAULT 0,
+    session_id TEXT,           -- implementer's Claude session, resumed after a server restart
+    phase TEXT,                -- implementing, reviewing, fixing: where to resume after a restart
+    resume_attempts INTEGER NOT NULL DEFAULT 0,
     pr_url TEXT,
     error TEXT,
     created_at REAL NOT NULL,
@@ -83,6 +86,15 @@ class Store:
         if "mode" not in columns:
             with self.db:
                 self.db.execute("ALTER TABLE conversations ADD COLUMN mode TEXT NOT NULL DEFAULT 'agent'")
+        task_columns = {r["name"] for r in self.db.execute("PRAGMA table_info(tasks)")}
+        for name, ddl in (
+            ("session_id", "TEXT"),
+            ("phase", "TEXT"),
+            ("resume_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in task_columns:
+                with self.db:
+                    self.db.execute(f"ALTER TABLE tasks ADD COLUMN {name} {ddl}")
 
     # conversations
 

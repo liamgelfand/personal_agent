@@ -2,6 +2,7 @@
 
 The pipeline is code-driven rather than left to the orchestrator, so every implementation
 is reviewed. Changes are left uncommitted for the user to review and commit in the IDE.
+A task interrupted by a server restart resumes on the next start (see TaskManager.recover).
 """
 
 from __future__ import annotations
@@ -27,6 +28,18 @@ from .workspace import get_workspace
 MAX_FIX_ROUNDS = 2
 IMPLEMENTER_TOOLS = ["Read", "Grep", "Glob", "Edit", "Write", "MultiEdit", "Bash", "TodoWrite"]
 ACTIVE = {"queued", "implementing", "reviewing", "fixing"}
+PHASES = {"implementing", "reviewing", "fixing"}
+MAX_RESUME_ATTEMPTS = 3
+FIX_PROMPT = "The reviewer requested changes. Fix the blocking and should_fix issues, then re-verify.\n\n"
+RESUME_PROMPT = (
+    "The server restarted while you were working. Continue where you left off; check `git status` "
+    "and the files first, since your last tool call may not have completed."
+)
+RESTART_NOTE = (
+    "\n\nThe server restarted during an earlier attempt at this, and that session could not be "
+    "resumed. The worktree may already hold uncommitted work from it: inspect it first (`git status`, "
+    "`git diff`) and keep what is good rather than starting over."
+)
 
 
 def _slug(text: str) -> str:
@@ -41,17 +54,52 @@ def _format_findings(review: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+class ResumeFailed(RuntimeError):
+    """A resumed implementer session failed before doing any work (e.g. its session file is gone)."""
+
+
 class TaskManager:
     def __init__(self, config: Config, store: Store, bus: Bus):
         self.config, self.store, self.bus = config, store, bus
         self.running: dict[str, asyncio.Task] = {}
         self.discarding: set[str] = set()
+        self.stopping: set[str] = set()
+        # Set when the server begins shutting down. Agent runs then fail or end early (on a console
+        # Ctrl+C the Claude children get the signal too); those endings must not become a final status.
+        self.shutting_down = False
+
+    async def shutdown(self) -> None:
+        """End running pipelines without changing their status, so the next start resumes them.
+
+        Cancelling a run makes the SDK close its Claude process (stdin EOF, then terminate, then
+        kill: about 15s at worst), so wait for that rather than leave a process editing the worktree.
+        """
+        self.shutting_down = True
+        jobs = set(self.running.values())
+        for job in jobs:
+            job.cancel()
+        if jobs:
+            await asyncio.wait(jobs, timeout=20)
 
     def recover(self) -> None:
-        """Tasks that were mid-run when the server stopped can't be resumed; mark them stopped."""
+        """Re-queue tasks that were mid-run when the server stopped; call with the event loop running.
+
+        Implementing and fixing continue the implementer's Claude session; reviewing reruns the
+        current review round. Each task gets MAX_RESUME_ATTEMPTS restarts, so a task that keeps
+        crashing the server ends as failed instead of looping.
+        """
         for task in self.store.tasks():
-            if task["status"] in ACTIVE:
-                self.store.update_task(task["id"], status="stopped", error="server restarted")
+            if task["status"] not in ACTIVE:
+                continue
+            if not Path(task["worktree"]).is_dir():
+                self.store.update_task(task["id"], status="stopped", error="server restarted and the worktree is gone")
+            elif task["resume_attempts"] >= MAX_RESUME_ATTEMPTS:
+                error = f"the server restarted {task['resume_attempts'] + 1} times during this task; gave up resuming"
+                self.store.add_event({"type": "error", "message": error}, task_id=task["id"])
+                self.store.update_task(task["id"], status="failed", error=error)
+            else:
+                self.store.update_task(task["id"], resume_attempts=task["resume_attempts"] + 1)
+                self.running[task["id"]] = asyncio.create_task(self._pipeline(task["id"], resume=True))
 
     async def _publish_task(self, task_id: str, **fields: Any) -> dict[str, Any]:
         task = self.store.update_task(task_id, **fields)
@@ -85,6 +133,7 @@ class TaskManager:
 
     def stop(self, task_id: str) -> bool:
         if job := self.running.get(task_id):
+            self.stopping.add(task_id)
             job.cancel()
             return True
         return False
@@ -170,48 +219,104 @@ class TaskManager:
             resume=session_id,
         )
 
-    async def _implement(self, ws, prompt: str, session_id: str | None) -> str | None:
-        async for event in run_agent(
-            self._implementer_options(ws, session_id), prompt, self.store, self.bus, "task", ws.task_id
-        ):
-            if event["type"] in ("text", "tool"):
-                await self._emit(ws.task_id, {**event, "agent": "implementer"})
-            elif event["type"] == "result":
-                if event["is_error"]:
-                    raise RuntimeError("; ".join(event["errors"] or ["implementer failed"]))
-                return event["session_id"]
-        return session_id
+    async def _implement(self, ws, prompt: str, session_id: str | None) -> None:
+        """Run the implementer, saving its session id as soon as it is known so a restart can resume it.
 
-    async def _pipeline(self, task_id: str) -> None:
+        Raises ResumeFailed when a resumed session (`session_id` set) fails before any text or tool use.
+        """
+        worked = False
+        try:
+            async for event in run_agent(
+                self._implementer_options(ws, session_id), prompt, self.store, self.bus, "task", ws.task_id
+            ):
+                if event["type"] == "session":
+                    self.store.update_task(ws.task_id, session_id=event["session_id"])
+                elif event["type"] in ("text", "tool"):
+                    worked = True
+                    await self._emit(ws.task_id, {**event, "agent": "implementer"})
+                elif event["type"] == "result":
+                    self.store.update_task(ws.task_id, session_id=event["session_id"])
+                    if event["is_error"]:
+                        raise RuntimeError("; ".join(event["errors"] or ["implementer failed"]))
+                    return
+            raise RuntimeError("the implementer ended without a result")
+        except Exception as exc:
+            if session_id and not worked:
+                raise ResumeFailed(str(exc)) from exc
+            raise
+
+    async def _resume_implementer(self, ws, session_id: str | None, fresh_prompt: str) -> None:
+        """After a restart: continue the saved session, or rerun the phase from `fresh_prompt`.
+
+        Only a session that could not be resumed at all is rerun; a resumed session that fails
+        later fails the task as usual.
+        """
+        if session_id:
+            try:
+                await self._implement(ws, RESUME_PROMPT, session_id)
+                return
+            except ResumeFailed as exc:
+                if self.shutting_down:
+                    raise
+                text = f"Could not resume session, restarted phase ({exc})"
+        else:
+            text = "No saved session to resume, restarted phase from the spec"
+        await self._emit(ws.task_id, {"type": "resumed", "agent": "pipeline", "text": text})
+        await self._implement(ws, fresh_prompt + RESTART_NOTE, None)
+
+    async def _pipeline(self, task_id: str, resume: bool = False) -> None:
         task = self.store.task(task_id)
         ws = get_workspace(self.config, self.store, task["repo"], task_id)
         try:
-            await self._publish_task(task_id, status="implementing")
-            prompt = (
+            spec_prompt = (
                 f"Task: {task['title']}\n\n{task['spec']}\n\n"
                 f"You are in an isolated git worktree on branch {task['branch']}. "
                 "Do not commit: the user reviews and commits the changes."
             )
-            session = await self._implement(ws, prompt, None)
-            for round_no in range(MAX_FIX_ROUNDS + 1):
-                await self._publish_task(task_id, status="reviewing", review_rounds=round_no + 1)
-                await self._emit(task_id, {"type": "text", "agent": "pipeline", "text": f"Review round {round_no + 1}"})
-                review = await review_workspace(ws, self.config, self.store, self.bus)
-                await self._emit(task_id, {"type": "review", "agent": "reviewer", "review": review})
-                if not has_open_findings(review) or round_no == MAX_FIX_ROUNDS:
-                    break
-                await self._publish_task(task_id, status="fixing")
-                session = await self._implement(
-                    ws, "The reviewer requested changes. Fix the blocking and should_fix issues, "
-                    "then re-verify.\n\n" + _format_findings(review), session,
-                )
+            # The phase to pick up after a restart; None once it has been resumed (or on a fresh run).
+            resume_phase = None
+            start_round = 0
+            if resume:
+                resume_phase = task["phase"] or (task["status"] if task["status"] in PHASES else "implementing")
+                start_round = max(task["review_rounds"] - 1, 0)
+                await self._emit(task_id, {"type": "resumed", "agent": "pipeline", "phase": resume_phase,
+                                           "text": f"Resumed after server restart ({resume_phase})"})
+            if resume_phase in (None, "implementing"):
+                await self._publish_task(task_id, status="implementing", phase="implementing")
+                if resume_phase:
+                    await self._resume_implementer(ws, task["session_id"], spec_prompt)
+                else:
+                    await self._implement(ws, spec_prompt, None)
+                resume_phase = None
+            for round_no in range(start_round, MAX_FIX_ROUNDS + 1):
+                if resume_phase != "fixing":  # reviews are read-only, so a resumed one just reruns
+                    await self._publish_task(task_id, status="reviewing", phase="reviewing", review_rounds=round_no + 1)
+                    await self._emit(task_id, {"type": "text", "agent": "pipeline", "text": f"Review round {round_no + 1}"})
+                    review = await review_workspace(ws, self.config, self.store, self.bus)
+                    if self.shutting_down:  # an interrupted review is no verdict; rerun it on the next start
+                        return
+                    await self._emit(task_id, {"type": "review", "agent": "reviewer", "review": review})
+                    if not has_open_findings(review) or round_no == MAX_FIX_ROUNDS:
+                        break
+                await self._publish_task(task_id, status="fixing", phase="fixing")
+                if resume_phase == "fixing":
+                    findings = _format_findings(self.store.review(ws.key) or {})
+                    await self._resume_implementer(ws, task["session_id"], f"{spec_prompt}\n\n{FIX_PROMPT}{findings}")
+                else:
+                    await self._implement(ws, FIX_PROMPT + _format_findings(review), self.store.task(task_id)["session_id"])
+                resume_phase = None
             await self._publish_task(task_id, status="ready")
         except asyncio.CancelledError:
-            if task_id not in self.discarding:  # a discard sets the final status itself
+            # Stop and discard are user actions; any other cancellation is the server shutting down,
+            # which leaves the task active so the next start resumes it.
+            if task_id in self.stopping:
                 await self._publish_task(task_id, status="stopped")
         except Exception as exc:
+            if self.shutting_down and task_id not in self.stopping:
+                return  # the agent died with the server; leave the task to resume
             await self._emit(task_id, {"type": "error", "message": f"{type(exc).__name__}: {exc}"})
             await self._publish_task(task_id, status="failed", error=str(exc))
         finally:
             self.running.pop(task_id, None)
             self.discarding.discard(task_id)
+            self.stopping.discard(task_id)

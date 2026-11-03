@@ -63,6 +63,7 @@ export type AgentEvent =
   | { type: 'error'; message: string }
   | { type: 'warning'; message: string }
   | { type: 'stopped' }
+  | { type: 'resumed'; text: string }
   | { type: 'checkpoint'; id: string; files: string[]; restored?: boolean }
 
 export type FileStatus = {
