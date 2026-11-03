@@ -1,5 +1,6 @@
 import { create } from 'zustand'
-import { api } from './api'
+import { api, ApiError } from './api'
+import * as chatTabList from './chatTabs'
 import type {
   AdminState, AgentEvent, Approval, Conversation, MobileView, Mode, Repo, Review, SideTab, Tab, Task, UsageWindow,
   WorkspaceRef,
@@ -8,6 +9,41 @@ import { wsKey } from './types'
 
 const mobileQuery = window.matchMedia('(max-width: 820px)')
 mobileQuery.addEventListener('change', (e) => useApp.setState({ isMobile: e.matches }))
+
+const CHAT_TABS_KEY = 'chatTabs'
+
+function loadChatTabs(): { ids?: unknown; active?: unknown } {
+  try {
+    return JSON.parse(localStorage.getItem(CHAT_TABS_KEY) ?? '{}') ?? {}
+  } catch {
+    return {}
+  }
+}
+
+// Conversations whose full event history has been fetched. After that the socket keeps them current,
+// so switching back to an open tab must not refetch (a refetch can drop events arriving meanwhile).
+const loadedConvs = new Set<string>()
+
+function cacheConvs(cache: Record<string, Conversation>, convs: Conversation[]) {
+  return convs.length ? { ...cache, ...Object.fromEntries(convs.map((c) => [c.id, c])) } : cache
+}
+
+// The conversation list is capped and History search filters it, so a tab's conversation may be missing
+// from it. Ask the server about those ones; only a 404 means it is gone.
+async function liveChatTabs(ids: string[], conversations: Conversation[]) {
+  const listed = new Set(conversations.map((c) => c.id))
+  const found: Conversation[] = []
+  const gone: string[] = []
+  await Promise.all(
+    ids.filter((id) => !listed.has(id)).map((id) =>
+      api.conversation(id).then(
+        (c) => void found.push(c),
+        (err) => void (err instanceof ApiError && err.status === 404 && gone.push(id)),
+      ),
+    ),
+  )
+  return { gone, found }
+}
 
 type ReviewState = { review: Review | null; running: boolean; progress: string[] }
 
@@ -20,6 +56,11 @@ type State = {
   convEvents: Record<string, AgentEvent[]>
   streaming: Record<string, string>
   busyConvs: Record<string, boolean>
+  chatTabs: string[]
+  unseenConvs: Record<string, boolean>
+  // Every conversation seen, by id. Tabs and the open chat read from here, because `conversations`
+  // is capped and History search filters it.
+  convCache: Record<string, Conversation>
 
   tasks: Task[]
   taskEvents: Record<string, AgentEvent[]>
@@ -46,7 +87,9 @@ type State = {
   init: () => Promise<void>
   resync: () => Promise<void>
   setWorkspace: (ws: WorkspaceRef) => void
-  openConversation: (id: string) => Promise<void>
+  openConversation: (id: string, refetch?: boolean) => Promise<void>
+  closeChatTab: (id: string) => Promise<void>
+  cycleChatTab: (step: number) => Promise<void>
   newConversation: (repo: string | null, mode?: Mode) => Promise<void>
   refreshConversations: (q?: string) => Promise<void>
   refreshTasks: () => Promise<void>
@@ -66,6 +109,9 @@ export const useApp = create<State>((set, get) => ({
   convEvents: {},
   streaming: {},
   busyConvs: {},
+  chatTabs: [],
+  unseenConvs: {},
+  convCache: {},
   tasks: [],
   taskEvents: {},
   approvals: [],
@@ -89,38 +135,76 @@ export const useApp = create<State>((set, get) => ({
   async init() {
     const [repos, conversations, tasks] = await Promise.all([api.repos(), api.conversations(), api.tasks()])
     const busyConvs = Object.fromEntries(conversations.filter((c) => c.busy).map((c) => [c.id, true]))
-    set({ repos, conversations, tasks, busyConvs, workspace: repos[0] ? { repo: repos[0].name, task: null } : null })
-    if (conversations[0]) await get().openConversation(conversations[0].id)
+    const saved = loadChatTabs()
+    const ids = chatTabList.pruneChatTabs(saved.ids)
+    const { gone, found } = await liveChatTabs(ids, conversations)
+    const chatTabs = ids.filter((id) => !gone.includes(id))
+    set((s) => ({
+      repos, conversations, tasks, busyConvs, chatTabs,
+      convCache: cacheConvs(s.convCache, found),
+      workspace: repos[0] ? { repo: repos[0].name, task: null } : null,
+    }))
+    const first = chatTabs.includes(saved.active as string) ? (saved.active as string) : (chatTabs[0] ?? conversations[0]?.id)
+    if (first) await get().openConversation(first)
   },
 
   async resync() {
     const [conversations, tasks] = await Promise.all([api.conversations(), api.tasks()])
     const busyConvs = Object.fromEntries(conversations.map((c) => [c.id, !!c.busy]))
-    set({ conversations, tasks, busyConvs })
-    const active = get().activeConv
-    if (active && conversations.some((c) => c.id === active)) await get().openConversation(active)
+    // Conversations deleted while disconnected lose their tabs, as a missed conversation_deleted would have done.
+    const { gone, found } = await liveChatTabs(get().chatTabs, conversations)
+    const before = get().activeConv
+    const next = chatTabList.removeChatTabs({ ids: get().chatTabs, active: before }, gone)
+    set((s) => ({ conversations, tasks, busyConvs, chatTabs: next.ids, activeConv: next.active, convCache: cacheConvs(s.convCache, found) }))
+    // Events may have been missed while disconnected, so every loaded conversation is stale.
+    loadedConvs.clear()
+    if (next.active) await get().openConversation(next.active, true)
   },
 
   setWorkspace(ws) {
     set({ workspace: ws })
   },
 
-  async openConversation(id) {
-    set({ activeConv: id })
-    const conv = await api.conversation(id)
+  async openConversation(id, refetch = false) {
+    set((s) => {
+      const unseenConvs = { ...s.unseenConvs }
+      delete unseenConvs[id]
+      return { activeConv: id, chatTabs: chatTabList.addChatTab(s.chatTabs, id), unseenConvs }
+    })
+    if (loadedConvs.has(id) && !refetch) return
+    const { events, ...conv } = await api.conversation(id)
+    loadedConvs.add(id)
     set((s) => ({
-      convEvents: { ...s.convEvents, [id]: conv.events },
+      convCache: cacheConvs(s.convCache, [conv]),
+      convEvents: { ...s.convEvents, [id]: events },
       busyConvs: { ...s.busyConvs, [id]: !!conv.busy },
     }))
   },
 
   async newConversation(repo, mode = 'agent') {
     const conv = await api.createConversation(repo, mode)
+    loadedConvs.add(conv.id)
     set((s) => ({
-      conversations: [conv, ...s.conversations],
+      conversations: s.conversations.some((c) => c.id === conv.id) ? s.conversations : [conv, ...s.conversations],
       activeConv: conv.id,
+      chatTabs: chatTabList.addChatTab(s.chatTabs, conv.id),
       convEvents: { ...s.convEvents, [conv.id]: [] },
     }))
+  },
+
+  async closeChatTab(id) {
+    const s = get()
+    const next = chatTabList.closeChatTab({ ids: s.chatTabs, active: s.activeConv }, id)
+    set({ chatTabs: next.ids })
+    if (next.active === s.activeConv) return
+    if (next.active) await get().openConversation(next.active)
+    else set({ activeConv: null })
+  },
+
+  async cycleChatTab(step) {
+    const s = get()
+    const next = chatTabList.cycleChatTab({ ids: s.chatTabs, active: s.activeConv }, step)
+    if (next && next !== s.activeConv) await get().openConversation(next)
   },
 
   async refreshConversations(q) {
@@ -171,6 +255,16 @@ export const useApp = create<State>((set, get) => ({
     setTimeout(() => set({ toast: null }), 4000)
   },
 }))
+
+useApp.subscribe((s, prev) => {
+  // Covers init, refreshes and conversation_updated (which adds unlisted conversations to the list).
+  if (s.conversations !== prev.conversations && s.conversations.some((c) => s.convCache[c.id] !== c)) {
+    useApp.setState({ convCache: cacheConvs(s.convCache, s.conversations) })
+  }
+  if (s.chatTabs !== prev.chatTabs || s.activeConv !== prev.activeConv) {
+    localStorage.setItem(CHAT_TABS_KEY, JSON.stringify({ ids: s.chatTabs, active: s.activeConv }))
+  }
+})
 
 export const tabId = {
   file: (ws: WorkspaceRef, path: string) => `file:${wsKey(ws)}:${path}`,

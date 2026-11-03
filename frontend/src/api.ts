@@ -3,6 +3,14 @@ import type {
   WorkspaceRef,
 } from './types'
 
+export class ApiError extends Error {
+  readonly status: number
+  constructor(message: string, status: number) {
+    super(message)
+    this.status = status
+  }
+}
+
 async function request<T>(method: string, url: string, body?: unknown): Promise<T> {
   const res = await fetch(url, {
     method,
@@ -11,7 +19,7 @@ async function request<T>(method: string, url: string, body?: unknown): Promise<
   })
   if (!res.ok) {
     const detail = await res.json().then((d) => d.detail).catch(() => res.statusText)
-    throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
+    throw new ApiError(typeof detail === 'string' ? detail : JSON.stringify(detail), res.status)
   }
   return res.json()
 }

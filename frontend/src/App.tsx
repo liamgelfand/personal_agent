@@ -35,6 +35,12 @@ function useShortcuts() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey)) return
+      // Ctrl+Tab cycles chat tabs (where the browser lets it through). No Ctrl+W: browsers reserve it to close the window.
+      if (e.key === 'Tab' && e.ctrlKey) {
+        e.preventDefault()
+        useApp.getState().cycleChatTab(e.shiftKey ? -1 : 1).catch(useApp.getState().showError)
+        return
+      }
       const key = e.key.toLowerCase()
       if (key === 'p' && !e.shiftKey) {
         e.preventDefault()
