@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import shutil
+import signal
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -55,14 +57,37 @@ chats = ChatManager(config, store, bus, tasks, checkpoints)
 reviews_running: set[str] = set()
 
 
+def flag_shutdown_on_signals() -> None:
+    """Tell the task manager about a shutdown the moment its signal arrives.
+
+    A console Ctrl+C also reaches the Claude child processes, which exit before uvicorn's graceful
+    shutdown gets to the lifespan; flagging first keeps their tasks resumable instead of failed.
+    Wraps the handlers uvicorn installed before startup, so its own shutdown still runs.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
+        previous = signal.getsignal(sig) if sig else None
+        if not callable(previous):
+            continue
+
+        def handler(signum, frame, previous=previous):
+            tasks.shutting_down = True
+            previous(signum, frame)
+
+        signal.signal(sig, handler)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    flag_shutdown_on_signals()
     tasks.recover()
     if config.remote.enabled:
         print(f"Remote access on. Access token: {remote.token()}  (also in {remote.TOKEN_PATH})", flush=True)
     watcher = asyncio.create_task(watch(config, bus, admin))
     yield
     watcher.cancel()
+    await tasks.shutdown()
 
 
 app = FastAPI(title="personal-agent", lifespan=lifespan)
@@ -222,6 +247,10 @@ async def admin_restart(force: bool = False) -> dict:
     busy = _busy()
     if any(busy.values()) and not force:
         raise HTTPException(409, f"agents are running ({busy}); wait or force the restart")
+    # os._exit skips the lifespan, so end the task pipelines (and their Claude processes) first;
+    # otherwise a leftover implementer could keep editing the worktree its resumed task works in.
+    if admin.supervised:
+        await tasks.shutdown()
     try:
         await admin.restart()
     except AdminError as exc:
@@ -234,6 +263,7 @@ async def admin_shutdown(force: bool = False) -> dict:
     busy = _busy()
     if any(busy.values()) and not force:
         raise HTTPException(409, f"agents are running ({busy}); wait or force the shutdown")
+    await tasks.shutdown()  # as for restart; the tasks stay active and resume on the next start
     await admin.shutdown()
     return {"stopping": True}
 

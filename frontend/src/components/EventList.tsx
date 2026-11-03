@@ -171,6 +171,8 @@ export function EventView({ event }: { event: AgentEvent }) {
           Stopped
         </div>
       )
+    case 'resumed':
+      return <div className="phase">{event.text}</div>
     default:
       return null
   }

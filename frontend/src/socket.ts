@@ -8,7 +8,7 @@ type ServerEvent = { type: string; [key: string]: unknown }
 let socket: WebSocket | null = null
 let retry = 0
 
-const PERSISTED = new Set(['user', 'text', 'tool', 'result', 'task_link', 'review', 'error', 'stopped', 'checkpoint'])
+const PERSISTED = new Set(['user', 'text', 'tool', 'result', 'task_link', 'review', 'error', 'stopped', 'resumed', 'checkpoint'])
 
 function append(map: Record<string, AgentEvent[]>, key: string, event: AgentEvent) {
   return { ...map, [key]: [...(map[key] ?? []), event] }

@@ -12,6 +12,7 @@ from claude_agent_sdk import (
     ResultError,
     ResultMessage,
     StreamEvent,
+    SystemMessage,
     TextBlock,
     ToolUseBlock,
     query,
@@ -50,11 +51,23 @@ def summarize_tool(name: str, args: dict[str, Any]) -> str:
 async def run_agent(
     options: ClaudeAgentOptions, prompt: str, store: Store, bus: Bus, kind: str, ref: str | None
 ) -> AsyncIterator[dict[str, Any]]:
-    """Yield events: delta, text, tool, result. Records cost; pushes rate limits to the bus."""
+    """Yield events: session, delta, text, tool, result. Records cost; pushes rate limits to the bus.
+
+    `session` comes once, as soon as a message carries the Claude session id, so callers can save
+    it before the run ends.
+    """
     run_id = store.start_run(kind, ref)
     result: ResultMessage | None = None
+    session_seen = False
     try:
         async for message in _messages(prompt, options):
+            session_id = (
+                message.data.get("session_id") if isinstance(message, SystemMessage)
+                else getattr(message, "session_id", None)
+            )
+            if session_id and not session_seen:
+                session_seen = True
+                yield {"type": "session", "session_id": session_id}
             if isinstance(message, StreamEvent):
                 event = message.event
                 delta = event.get("delta", {})
