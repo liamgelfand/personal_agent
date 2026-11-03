@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 import shutil
+import stat
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -213,7 +214,83 @@ async def add_worktree(repo: Path, path: Path, branch: str) -> None:
     await git(repo, "worktree", "add", "-b", branch, str(path), "HEAD")
 
 
+def is_link(path: Path) -> bool:
+    """A symlink or, on Windows, a directory junction (which Python 3.11's is_symlink misses)."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def package_dirs(root: Path) -> list[Path]:
+    """The root and its direct subfolders that hold a package.json (not following links)."""
+    subdirs = sorted(d for d in root.iterdir() if d.is_dir() and not is_link(d)) if root.is_dir() else []
+    return [d for d in [root, *subdirs] if (d / "package.json").is_file()]
+
+
+def dependency_dirs(repo: Path) -> list[str]:
+    """node_modules folders in a checkout, at the top level or one down, each next to a package.json."""
+    return [
+        (d / "node_modules").relative_to(repo).as_posix() for d in package_dirs(repo)
+        if (d / "node_modules").is_dir() and not is_link(d / "node_modules")
+    ]
+
+
+def dependency_links(worktree: Path) -> list[str]:
+    """node_modules links in a worktree (see link_dependencies)."""
+    dirs = [worktree, *(d for d in worktree.iterdir() if d.is_dir() and not is_link(d))] if worktree.is_dir() else []
+    return [(d / "node_modules").relative_to(worktree).as_posix() for d in dirs if is_link(d / "node_modules")]
+
+
+def _link_dir(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        import _winapi  # a junction needs no admin rights or developer mode, unlike a symlink
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def _unlink_dir(link: Path) -> None:
+    """Remove a directory link itself, never what it points to."""
+    if os.name == "nt":
+        os.rmdir(link)  # removes a junction or directory symlink without touching the target
+    else:
+        os.unlink(link)
+
+
+async def link_dependencies(repo: Path, worktree: Path) -> list[str]:
+    """Link the main checkout's node_modules folders into a new worktree; returns the paths linked.
+
+    Skips folders the worktree already has and packages it lacks. A link git does not already
+    ignore is added to the repo's info/exclude, so it is never committed.
+    """
+    linked: list[str] = []
+    for rel in dependency_dirs(repo):
+        link = worktree / rel
+        if link.exists() or is_link(link) or not (link.parent / "package.json").is_file():
+            continue
+        _link_dir(link, repo / rel)
+        linked.append(rel)
+        if not (await git(worktree, "check-ignore", "--", rel, check=False)).strip():
+            exclude = Path((await git(worktree, "rev-parse", "--git-path", "info/exclude")).strip())
+            exclude = exclude if exclude.is_absolute() else worktree / exclude
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            lines = exclude.read_text(encoding="utf-8").splitlines() if exclude.exists() else []
+            if f"/{rel}" not in lines:
+                exclude.write_text("\n".join([*lines, f"/{rel}"]) + "\n", encoding="utf-8")
+    return linked
+
+
+def remove_dependency_links(worktree: Path) -> None:
+    for rel in dependency_links(worktree):
+        _unlink_dir(worktree / rel)
+
+
 async def remove_worktree(repo: Path, path: Path, branch: str) -> None:
+    # Unlink shared node_modules first, so neither git nor rmtree can reach into the main checkout's copy.
+    remove_dependency_links(path)
     await git(repo, "worktree", "remove", "--force", str(path), check=False)
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)

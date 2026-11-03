@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     session_id TEXT,           -- implementer's Claude session, resumed after a server restart
     phase TEXT,                -- implementing, reviewing, fixing: where to resume after a restart
     resume_attempts INTEGER NOT NULL DEFAULT 0,
+    timing TEXT,               -- per-phase durations once finished, e.g. "implement 9m, review 5m"
     pr_url TEXT,
     pr_state TEXT,             -- 'open': gh opened the PR; 'compare': pr_url is GitHub's compare page
     finish_error TEXT,         -- why the push/PR after review failed; the task stays ready
@@ -93,6 +94,7 @@ class Store:
             ("session_id", "TEXT"),
             ("phase", "TEXT"),
             ("resume_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("timing", "TEXT"),
             ("pr_state", "TEXT"),
             ("finish_error", "TEXT"),
         ):

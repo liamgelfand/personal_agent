@@ -266,6 +266,8 @@ export function EventView({ event, edit }: { event: AgentEvent; edit?: { convId:
         </div>
       )
     case 'resumed':
+    case 'phase':
+    case 'timing':
       return <div className="phase">{event.text}</div>
     case 'finished':
       return (

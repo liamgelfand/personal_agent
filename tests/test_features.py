@@ -894,7 +894,7 @@ def _resume_manager(tmp_path, monkeypatch, fail_resume=False):
         yield {"type": "session", "session_id": "new-session"}
         yield {"type": "result", "is_error": False, "errors": None, "session_id": "new-session"}
 
-    async def fake_review(ws, config, store, bus):
+    async def fake_review(ws, config, store, bus, stats=None):
         return {"verdict": "approve", "summary": "ok", "findings": []}
 
     monkeypatch.setattr(tasks_mod, "run_agent", fake_run_agent)
@@ -969,14 +969,14 @@ async def test_no_automatic_pr_while_the_final_review_has_open_findings(tmp_path
         finished.append(task_id)
         return {}
 
-    async def still_blocking(ws, config, store, bus):
+    async def still_blocking(ws, config, store, bus, stats=None):
         return {"verdict": "changes_requested", "summary": "no", "findings": [
             {"severity": "blocking", "file": "a.py", "line": 1, "title": "t", "detail": "d"},
         ]}
 
     monkeypatch.setattr(manager, "_finish", finish)
     monkeypatch.setattr(tasks_mod, "review_workspace", still_blocking)
-    add("t", status="reviewing", phase="reviewing", review_rounds=tasks_mod.MAX_FIX_ROUNDS + 1)
+    add("t", status="reviewing", phase="reviewing", review_rounds=manager.config.max_review_rounds)
     manager.recover()
     await settle()
     task = store.task("t")
@@ -1086,7 +1086,7 @@ async def test_agents_dying_with_the_server_leave_tasks_resumable(tmp_path, monk
             raise RuntimeError("Command failed with exit code 3221225786")  # the child got Ctrl+C
         # otherwise the stream just ends with no result
 
-    async def interrupted_review(ws, config, store, bus):
+    async def interrupted_review(ws, config, store, bus, stats=None):
         return {"verdict": "changes_requested", "summary": "Review was interrupted.", "findings": []}
 
     monkeypatch.setattr(tasks_mod, "run_agent", dies_on_shutdown)
