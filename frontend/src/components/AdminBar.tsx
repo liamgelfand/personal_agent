@@ -4,7 +4,7 @@ import { api } from '../api'
 import { useApp } from '../store'
 
 // Shown when this app's own source changed (usually an agent working on personal_agent):
-// rebuild the UI and/or restart the server without leaving the browser.
+// one button rebuilds the UI and/or restarts the server, whichever changed, without leaving the browser.
 export function AdminBar() {
   const admin = useApp((s) => s.admin)
   const restarting = useApp((s) => s.restarting)
@@ -12,13 +12,21 @@ export function AdminBar() {
   const showError = useApp((s) => s.showError)
   const [built, setBuilt] = useState(false)
   const wasBuilding = useRef(false)
+  const applying = useRef(false)
 
-  // A build that just finished cleanly means the page can reload into the new UI.
+  // A build that just finished cleanly means the page can reload into the new UI, or, when applying
+  // all changes, the server restarts next (the page reloads when it is back).
   useEffect(() => {
     if (admin?.building) wasBuilding.current = true
     else if (wasBuilding.current) {
       wasBuilding.current = false
-      if (admin && !admin.pending.ui) setBuilt(true)
+      const finishing = applying.current
+      applying.current = false
+      if (admin && !admin.pending.ui) {
+        if (finishing && admin.pending.server) void restart()
+        else if (finishing) location.reload()
+        else setBuilt(true)
+      }
     }
   }, [admin])
 
@@ -39,6 +47,16 @@ export function AdminBar() {
     }
   }
 
+  function apply() {
+    if (ui) {
+      applying.current = true
+      api.rebuild().catch((e) => {
+        applying.current = false
+        showError(e)
+      })
+    } else void restart()
+  }
+
   let text: string
   if (restarting) text = 'Restarting the server. The page reloads when it is back.'
   else if (admin.building) text = log[log.length - 1] ?? 'Building the UI'
@@ -52,12 +70,14 @@ export function AdminBar() {
       <div className="spacer" />
       {!restarting && !admin.building && (
         <>
-          {ui && (
-            <button className="btn sm" onClick={() => api.rebuild().catch(showError)}>Rebuild UI</button>
-          )}
-          {server && (
-            <button className="btn sm" onClick={restart} disabled={!admin.supervised} title={admin.supervised ? '' : 'Start the server with `uv run personal-agent` to enable restarts'}>
-              Restart server
+          {(ui || server) && (
+            <button
+              className="btn sm"
+              onClick={apply}
+              disabled={server && !admin.supervised}
+              title={server && !admin.supervised ? 'Start the server with `uv run personal-agent` to enable restarts' : ''}
+            >
+              {ui && server ? 'Rebuild UI and restart server' : server ? 'Restart server' : 'Rebuild UI'}
             </button>
           )}
           {built && !server && <button className="btn sm primary" onClick={() => location.reload()}>Reload page</button>}
