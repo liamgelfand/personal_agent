@@ -11,7 +11,7 @@ import { beforeUserMessage } from '../socket'
 import { tabId, useApp } from '../store'
 import type { AgentEvent } from '../types'
 import { FindingRow } from './ChangesPanel'
-import { markdownComponents } from './ExternalLink'
+import { ExternalLink, markdownComponents } from './ExternalLink'
 
 type ToolEvent = Extract<AgentEvent, { type: 'tool' }>
 
@@ -269,6 +269,15 @@ export function EventView({ event, edit }: { event: AgentEvent; edit?: { convId:
     case 'phase':
     case 'timing':
       return <div className="phase">{event.text}</div>
+    case 'finished':
+      return (
+        <div className="event-card msg-text">
+          <ExternalLink href={event.url}>
+            {event.pr_state === 'compare' ? 'Open compare page' : 'Review PR'}
+          </ExternalLink>
+          <div className="muted">{event.text}</div>
+        </div>
+      )
     default:
       return null
   }

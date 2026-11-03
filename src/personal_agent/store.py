@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     resume_attempts INTEGER NOT NULL DEFAULT 0,
     timing TEXT,               -- per-phase durations once finished, e.g. "implement 9m, review 5m"
     pr_url TEXT,
+    pr_state TEXT,             -- 'open': gh opened the PR; 'compare': pr_url is GitHub's compare page
+    finish_error TEXT,         -- why the push/PR after review failed; the task stays ready
     error TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
@@ -93,6 +95,8 @@ class Store:
             ("phase", "TEXT"),
             ("resume_attempts", "INTEGER NOT NULL DEFAULT 0"),
             ("timing", "TEXT"),
+            ("pr_state", "TEXT"),
+            ("finish_error", "TEXT"),
         ):
             if name not in task_columns:
                 with self.db:

@@ -57,9 +57,9 @@ each finding against the file and line in the new version of the file.
 READ_TOOLS = ["Read", "Grep", "Glob", "Bash"]
 
 
-def has_blocking_findings(review: dict[str, Any]) -> bool:
-    """Only blocking findings warrant another fix round; should_fix and nit stay in the review."""
-    return any(f["severity"] == "blocking" for f in review.get("findings", []))
+def has_open_findings(review: dict[str, Any]) -> bool:
+    """Blocking and should_fix findings warrant another fix round; nits stay in the review."""
+    return any(f["severity"] in ("blocking", "should_fix") for f in review.get("findings", []))
 
 
 async def review_workspace(

@@ -6,7 +6,7 @@ runs on your Claude subscription login (Pro or Max), so it costs nothing beyond 
 
 - **Orchestrator** chats with you, answers questions, makes small edits, and starts tasks.
 - **Tasks** run a fixed pipeline in an isolated git worktree: implementer, then reviewer, then a
-  fix and re-review only while blocking findings remain (`max_review_rounds`, default 2). The
+  fix and re-review only while blocking or should-fix findings remain (`max_review_rounds`, default 2). The
   worktree shares the main checkout's `node_modules`. Changes stay uncommitted so you review the
   diff and commit yourself.
 - **Reviewer** checks any uncommitted changes on request and pins its findings to diff lines.

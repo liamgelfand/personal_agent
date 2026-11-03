@@ -32,6 +32,9 @@ export type Task = {
   status: TaskStatus
   review_rounds: number
   pr_url: string | null
+  // 'open': a real PR; 'compare': pr_url is GitHub's compare page (gh could not open the PR)
+  pr_state: 'open' | 'compare' | null
+  finish_error: string | null // why the push/PR after review failed; the task stays ready
   error: string | null
   timing: string | null // per-phase durations once finished, e.g. "implement 9m, review 5m"
   created_at: number
@@ -67,6 +70,7 @@ export type AgentEvent =
   | { type: 'resumed'; text: string }
   | { type: 'phase'; text: string; phase: string; seconds: number }
   | { type: 'timing'; text: string; summary: string }
+  | { type: 'finished'; text: string; url: string; pr_state: 'open' | 'compare' }
   | { type: 'checkpoint'; id: string; files: string[]; restored?: boolean }
 
 export type FileStatus = {

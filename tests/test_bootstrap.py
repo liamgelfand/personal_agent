@@ -212,9 +212,14 @@ def _manager(tmp_path, monkeypatch, reviews: list[dict], **config):
 
     monkeypatch.setattr(tasks_mod, "run_agent", fake_run_agent)
     monkeypatch.setattr(tasks_mod, "review_workspace", fake_review)
+
+    async def fake_finish(task_id):  # pushing and opening a PR are covered in test_features
+        return {}
+
     store = Store(tmp_path / "t.db")
     repo = Repo(name="r", path=tmp_path, access=Access.WRITE, **config.pop("repo", {}))
     manager = tasks_mod.TaskManager(Config(repos=[repo], **config), store, Bus())
+    monkeypatch.setattr(manager, "_finish", fake_finish)
     wt = tmp_path / "wt"
     wt.mkdir()
     store.create_task(id="t", conversation_id=None, repo="r", title="t", spec="the spec",
@@ -230,8 +235,8 @@ def finding(severity: str) -> dict:
     return {"file": "app.py", "line": 1, "severity": severity, "title": f"a {severity}", "detail": "d"}
 
 
-async def test_non_blocking_findings_end_the_review_loop(tmp_path, monkeypatch):
-    review = {"verdict": "approve", "summary": "fine", "findings": [finding("should_fix"), finding("nit")]}
+async def test_nit_only_findings_end_the_review_loop(tmp_path, monkeypatch):
+    review = {"verdict": "approve", "summary": "fine", "findings": [finding("nit")]}
     manager, store, calls, run = _manager(tmp_path, monkeypatch, [review])
     await run()
     assert calls["review"] == 1 and len(calls["implement"]) == 1
@@ -248,12 +253,13 @@ async def test_review_loop_respects_max_review_rounds(tmp_path, monkeypatch):
     task = store.task("t")
     assert task["status"] == "ready" and task["review_rounds"] == 2
     warnings = [e["message"] for e in store.events(task_id="t") if e["type"] == "warning"]
-    assert len(warnings) == 1 and "Review limit reached (2 rounds)" in warnings[0] and "a blocking" in warnings[0]
+    assert "Review limit reached (2 rounds)" in warnings[0] and "a blocking" in warnings[0]
+    assert "open findings" in warnings[1]  # no PR is opened with open findings; see test_features
 
 
-async def test_blocking_then_clean_review_stops_before_the_cap(tmp_path, monkeypatch):
+async def test_open_then_clean_review_stops_before_the_cap(tmp_path, monkeypatch):
     blocking = {"verdict": "changes_requested", "summary": "bad", "findings": [finding("blocking")]}
-    clean = {"verdict": "approve", "summary": "ok", "findings": [finding("should_fix")]}
+    clean = {"verdict": "approve", "summary": "ok", "findings": [finding("nit")]}
     manager, store, calls, run = _manager(tmp_path, monkeypatch, [blocking, clean], max_review_rounds=5)
     await run()
     assert calls["review"] == 2 and len(calls["implement"]) == 2
