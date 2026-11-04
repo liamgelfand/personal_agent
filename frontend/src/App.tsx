@@ -11,6 +11,7 @@ import { FileTree } from './components/FileTree'
 import { QuickOpen } from './components/QuickOpen'
 import { SearchPanel } from './components/SearchPanel'
 import { ACTIVE_STATUSES, TasksPanel, useTaskNotices } from './components/TasksPanel'
+import { TerminalPanel } from './components/TerminalPanel'
 import { TopBar } from './components/TopBar'
 import { connect } from './socket'
 import { useApp } from './store'
@@ -35,6 +36,12 @@ function useShortcuts() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey)) return
+      // Ctrl+` shows or hides the terminal, also while it has focus (the phone layout has none).
+      if (e.code === 'Backquote' && e.ctrlKey && !useApp.getState().isMobile) {
+        e.preventDefault()
+        useApp.getState().toggleTerminal()
+        return
+      }
       // Ctrl+Tab cycles chat tabs (where the browser lets it through). No Ctrl+W: browsers reserve it to close the window.
       if (e.key === 'Tab' && e.ctrlKey) {
         e.preventDefault()
@@ -109,7 +116,12 @@ function DesktopLayout() {
       </Panel>
       <Separator className="separator" />
       <Panel defaultSize="51" minSize={320}>
-        <EditorArea />
+        <div className="editor-column">
+          <div className="editor-column-main">
+            <EditorArea />
+          </div>
+          <TerminalPanel />
+        </div>
       </Panel>
       <Separator className="separator" />
       <Panel defaultSize="30" minSize={320}>

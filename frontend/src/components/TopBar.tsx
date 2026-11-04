@@ -1,4 +1,4 @@
-import { ChevronRight } from 'lucide-react'
+import { ChevronRight, SquareTerminal } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { useApp } from '../store'
@@ -13,6 +13,8 @@ export function TopBar() {
   const tasks = useApp((s) => s.tasks)
   const windows = useApp((s) => s.windows)
   const setWorkspace = useApp((s) => s.setWorkspace)
+  const isMobile = useApp((s) => s.isMobile)
+  const terminalOpen = useApp((s) => s.terminalOpen)
 
   // Only tasks that still have a worktree can be opened as a workspace.
   const repoTasks = tasks.filter((t) => t.repo === workspace?.repo && t.status !== 'discarded' && t.status !== 'merged')
@@ -73,6 +75,17 @@ Billing mode: ${auth.billing}`}
           <span className={`dot ${onPlan ? 'ok' : 'warn'}`} />
           {onPlan ? `Claude ${plan} plan` : auth.error ? 'Login unknown' : 'API billing'}
         </span>
+      )}
+      {!isMobile && (
+        <button
+          className={`icon-btn ${terminalOpen ? 'on' : ''}`}
+          onClick={() => useApp.getState().toggleTerminal()}
+          title="Terminal (Ctrl+`)"
+          aria-label="Terminal"
+          aria-pressed={terminalOpen}
+        >
+          <SquareTerminal size={15} />
+        </button>
       )}
       <PhonePanel />
     </header>

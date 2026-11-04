@@ -68,6 +68,13 @@ http://127.0.0.1:5173.
   open a pull request, or discard it.
 - **Approvals**: commits, pushes, package installs, and similar commands pause the agent until
   you allow or deny them.
+- **Terminal**: ``Ctrl+` `` or the terminal button in the top bar opens a docked shell under the
+  editor, with tabs for up to 8 terminals and a draggable height. A new terminal starts in the open
+  chat's repo (in the selected task worktree if the top bar shows one of that repo's), in
+  `data/scratch` for a chat with no repo, or in the selected workspace when no chat is open.
+  Terminals keep running while the dock is hidden. The shell is PowerShell on Windows (`pwsh` if
+  installed) and `$SHELL` or `/bin/bash` elsewhere; set `terminal.shell` to change it. See
+  [Terminal security](#terminal-security).
 
 ## Configuration
 
@@ -98,6 +105,21 @@ With `auto_approve: false` also: `git commit`, `git push`, `gh pr/issue create|e
 package installs, `curl | sh`, `docker`.
 Bash in writable workspaces can still reach anything your user account can, so this is a
 guardrail, not a sandbox. Only delegate repos you are comfortable with an agent changing.
+
+### Terminal security
+
+The terminal is a real shell running as your user, so no guard applies to it. The server decides
+where it starts, from `config.yaml` repos, task worktrees, or the scratch folder; it never takes a
+path from the browser. It is refused:
+
+- for repos with `access: read`, since a shell could edit them;
+- to web pages this server didn't serve (the same Origin and loopback-Host checks as the live-events
+  socket, which also block DNS rebinding) and, with remote access on, to devices that haven't signed in;
+- to every device other than this computer, signed-in phones included, unless you set
+  `terminal: { allow_remote: true }` (it only applies while remote access is on). Then anyone
+  with the access token gets a shell on this computer.
+
+Closing a terminal, or stopping or restarting the server, kills its shell and the programs it started.
 
 ### Phone access
 
@@ -134,6 +156,7 @@ src/personal_agent/
   workspace.py, gitops.py   file access, search, and git operations per workspace
   admin.py, watcher.py      self-update (rebuild / restart) and live file-change events
   remote.py, notify.py      remote sign-in and ntfy notifications
+  terminal.py               integrated terminal: shells in a pseudo-terminal (ConPTY on Windows)
   store.py                  SQLite (data/agent.db)
 frontend/                   React + Monaco IDE
 tests/                      pytest
