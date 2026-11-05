@@ -49,6 +49,11 @@ the background (no terminal; output goes to `data/logs/server.log`) if it isn't 
 then opens the app in your default browser: as a standalone app window for Chrome, Edge, Brave,
 and Vivaldi, or a normal tab otherwise. Opening it again reuses the running server. To stop the
 server: `python -m uv run python -m personal_agent.launcher --stop`.
+
+The app window uses its own browser profile (`data/browser`), so it opens maximized every time. To
+pin it to the taskbar with its own icon, once: open the app from the shortcut, choose
+"Install Personal Agent" from the window's menu, then close it and pin the window the next launch
+opens. Later launches open the installed app.
 For UI development with hot reload, also run `cd frontend && npm run dev` and open
 http://127.0.0.1:5173.
 

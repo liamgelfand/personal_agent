@@ -28,7 +28,8 @@ CHROME_PATHS = [
     for var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")
 ]
 LOG_PATH = DATA_DIR / "logs" / "server.log"
-ICON_PNG = PROJECT_ROOT / "frontend" / "public" / "icon-512.png"
+BROWSER_PROFILE = DATA_DIR / "browser"
+ICON_PNG =PROJECT_ROOT / "frontend" / "public" / "icon-512.png"
 ICON_ICO = DATA_DIR / "icon.ico"
 
 
@@ -88,12 +89,25 @@ def default_browser() -> Path | None:
         return None
 
 
+def installed_app_id() -> str | None:
+    """The id of this app once installed from the app window's menu (Install Personal Agent)."""
+    resources = BROWSER_PROFILE / "Default" / "Web Applications" / "Manifest Resources"
+    if not resources.is_dir():
+        return None
+    return next((p.name for p in resources.iterdir() if p.is_dir()), None)
+
+
 def open_app(url: str, tab: bool = False) -> None:
     browser = default_browser()
     if browser is None or not browser.exists():
         browser = next((p for p in CHROME_PATHS if p.exists()), None)  # fall back to Chrome
     if not tab and browser and browser.name.lower() in APP_MODE_BROWSERS:
-        subprocess.Popen([str(browser), f"--app={url}", "--start-maximized"])
+        # A dedicated profile makes this its own browser process: a window handed to an already running
+        # browser ignores --start-maximized, and only an installed app (see installed_app_id) pins with
+        # its own icon instead of the browser's.
+        app_id = installed_app_id()
+        target = f"--app-id={app_id}" if app_id else f"--app={url}"
+        subprocess.Popen([str(browser), f"--user-data-dir={BROWSER_PROFILE}", target, "--start-maximized"])
     elif browser and browser.exists():
         subprocess.Popen([str(browser), url])
     else:
