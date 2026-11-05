@@ -9,10 +9,19 @@ import type {
 import { wsKey } from './types'
 
 const mobileQuery = window.matchMedia('(max-width: 820px)')
-mobileQuery.addEventListener('change', (e) => useApp.setState({ isMobile: e.matches }))
+mobileQuery.addEventListener('change', (e) => {
+  // The phone layout has no terminal dock, so its shells are closed (the server kills them when the
+  // socket drops); forget their tabs rather than silently starting new shells under the old titles.
+  // Back on desktop, an open dock gets one fresh shell.
+  useApp.setState(e.matches ? { isMobile: true, terminals: [], activeTerminal: null } : { isMobile: false })
+  const { terminalOpen, terminals, newTerminal } = useApp.getState()
+  if (!e.matches && terminalOpen && !terminals.length) newTerminal()
+})
 
 const CHAT_TABS_KEY = 'chatTabs'
 const DISMISSED_TASKS_KEY = 'dismissedTasks'
+const TERMINAL_KEY = 'terminalDock'
+export const MAX_TERMINALS = 8 // the server's limit too (terminal.py)
 
 function loadChatTabs(): { ids?: unknown; active?: unknown } {
   try {
@@ -29,6 +38,27 @@ function loadDismissedTasks(): string[] {
     return []
   }
 }
+
+function loadTerminalDock(): { open: boolean; height: number } {
+  try {
+    const saved = JSON.parse(localStorage.getItem(TERMINAL_KEY) ?? '{}') ?? {}
+    return { open: saved.open === true, height: typeof saved.height === 'number' ? saved.height : 260 }
+  } catch {
+    return { open: false, height: 260 }
+  }
+}
+
+// A shell's folder, decided when it opens: the open chat's repo (scratch if the chat has none), or the
+// IDE workspace when no chat is open. A chat on the workspace's repo uses the workspace, so a task
+// worktree selected in the top bar gets the terminal. The server resolves the actual path.
+function terminalTarget(s: State): Omit<TerminalRef, 'id'> {
+  const conv = s.activeConv ? s.convCache[s.activeConv] : undefined
+  const { repo, task } = conv && conv.repo !== s.workspace?.repo ? { repo: conv.repo, task: null } : (s.workspace ?? { repo: null, task: null })
+  const taskTitle = task ? s.tasks.find((t) => t.id === task)?.title : undefined
+  return { repo, task, title: repo ? (task ? `${repo}: ${taskTitle ?? 'task'}` : repo) : 'scratch' }
+}
+
+let terminalSeq = 0
 
 // Conversations whose full event history has been fetched. After that the socket keeps them current,
 // so switching back to an open tab must not refetch (a refetch can drop events arriving meanwhile).
@@ -54,6 +84,8 @@ async function liveChatTabs(ids: string[], conversations: Conversation[]) {
   )
   return { gone, found }
 }
+
+export type TerminalRef = { id: string; repo: string | null; task: string | null; title: string }
 
 type ReviewState = { review: Review | null; running: boolean; progress: string[] }
 
@@ -96,6 +128,11 @@ type State = {
   restarting: boolean
   undone: Record<string, boolean>
 
+  terminals: TerminalRef[]
+  activeTerminal: string | null
+  terminalOpen: boolean
+  terminalHeight: number
+
   init: () => Promise<void>
   resync: () => Promise<void>
   setWorkspace: (ws: WorkspaceRef) => void
@@ -112,6 +149,9 @@ type State = {
   loadReview: (ws: WorkspaceRef) => Promise<void>
   showError: (err: unknown) => void
   showInfo: (text: string) => void
+  toggleTerminal: () => void
+  newTerminal: () => void
+  closeTerminal: (id: string) => void
 }
 
 export const useApp = create<State>((set, get) => ({
@@ -146,6 +186,11 @@ export const useApp = create<State>((set, get) => ({
   restarting: false,
   undone: {},
 
+  terminals: [],
+  activeTerminal: null,
+  terminalOpen: loadTerminalDock().open,
+  terminalHeight: loadTerminalDock().height,
+
   async init() {
     const [repos, conversations, tasks] = await Promise.all([api.repos(), api.conversations(), api.tasks()])
     const busyConvs = Object.fromEntries(conversations.filter((c) => c.busy).map((c) => [c.id, true]))
@@ -160,6 +205,7 @@ export const useApp = create<State>((set, get) => ({
     }))
     const first = chatTabs.includes(saved.active as string) ? (saved.active as string) : (chatTabs[0] ?? conversations[0]?.id)
     if (first) await get().openConversation(first)
+    if (get().terminalOpen && !get().terminals.length) get().newTerminal()
   },
 
   async resync() {
@@ -272,6 +318,29 @@ export const useApp = create<State>((set, get) => ({
     set({ toast: { text, kind: 'info' } })
     setTimeout(() => set({ toast: null }), 4000)
   },
+
+  toggleTerminal() {
+    const open = !get().terminalOpen
+    set({ terminalOpen: open })
+    if (open && !get().terminals.length) get().newTerminal()
+  },
+
+  newTerminal() {
+    const s = get()
+    if (s.terminals.length >= MAX_TERMINALS) return
+    const term = { id: `t${Date.now().toString(36)}-${++terminalSeq}`, ...terminalTarget(s) }
+    set({ terminals: [...s.terminals, term], activeTerminal: term.id, terminalOpen: true })
+  },
+
+  closeTerminal(id) {
+    set((s) => {
+      const index = s.terminals.findIndex((t) => t.id === id)
+      const terminals = s.terminals.filter((t) => t.id !== id)
+      const activeTerminal = s.activeTerminal === id ? (terminals[Math.max(0, index - 1)]?.id ?? null) : s.activeTerminal
+      // Closing the last one hides the dock rather than leaving it empty.
+      return { terminals, activeTerminal, ...(terminals.length ? {} : { terminalOpen: false }) }
+    })
+  },
 }))
 
 useApp.subscribe((s, prev) => {
@@ -281,6 +350,9 @@ useApp.subscribe((s, prev) => {
   }
   if (s.chatTabs !== prev.chatTabs || s.activeConv !== prev.activeConv) {
     localStorage.setItem(CHAT_TABS_KEY, JSON.stringify({ ids: s.chatTabs, active: s.activeConv }))
+  }
+  if (s.terminalOpen !== prev.terminalOpen || s.terminalHeight !== prev.terminalHeight) {
+    localStorage.setItem(TERMINAL_KEY, JSON.stringify({ open: s.terminalOpen, height: s.terminalHeight }))
   }
   if (s.dismissedTasks !== prev.dismissedTasks) {
     localStorage.setItem(DISMISSED_TASKS_KEY, JSON.stringify(s.dismissedTasks))

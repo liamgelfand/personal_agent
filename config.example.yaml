@@ -42,5 +42,13 @@ remote:
 notifications:
   ntfy_topic: null
 
+# Integrated terminal (Ctrl+` in the IDE). shell: a program, or [program, args...]; unset uses
+# PowerShell on Windows (pwsh if installed) and $SHELL or /bin/bash elsewhere. Terminals only open
+# on this computer; allow_remote: true also lets signed-in remote devices open a shell here.
+terminal:
+  # shell: C:/Program Files/Git/bin/bash.exe
+  # shell: [bash, --login]
+  allow_remote: false
+
 # Run commits, pushes, PRs, installs etc. without asking. Merging a PR always asks; hard blocks still apply.
 auto_approve: false

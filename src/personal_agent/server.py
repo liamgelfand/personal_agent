@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import gitops, launcher, remote
+from . import gitops, launcher, remote, terminal
 from .admin import Admin, AdminError
 from .bus import Bus
 from .chat import ChatManager
@@ -28,6 +28,7 @@ from .notify import Notifier
 from .review import review_workspace
 from .store import Store
 from .tasks import TaskManager
+from .terminal import Terminals, TerminalError
 from .watcher import watch
 from .workspace import WorkspaceError, get_workspace, list_files, read_file, search, write_file
 
@@ -55,6 +56,7 @@ checkpoints = Checkpoints(store)
 tasks = TaskManager(config, store, bus)
 chats = ChatManager(config, store, bus, tasks, checkpoints)
 reviews_running: set[str] = set()
+terminals = Terminals()
 
 
 def flag_shutdown_on_signals() -> None:
@@ -87,6 +89,7 @@ async def lifespan(app: FastAPI):
     watcher = asyncio.create_task(watch(config, bus, admin))
     yield
     watcher.cancel()
+    await terminals.close_all()
     await tasks.shutdown()
 
 
@@ -270,6 +273,7 @@ async def admin_restart(force: bool = False) -> dict:
     # os._exit skips the lifespan, so end the task pipelines (and their Claude processes) first;
     # otherwise a leftover implementer could keep editing the worktree its resumed task works in.
     if admin.supervised:
+        await terminals.close_all()
         await tasks.shutdown()
     try:
         await admin.restart()
@@ -283,6 +287,7 @@ async def admin_shutdown(force: bool = False) -> dict:
     busy = _busy()
     if any(busy.values()) and not force:
         raise HTTPException(409, f"agents are running ({busy}); wait or force the shutdown")
+    await terminals.close_all()
     await tasks.shutdown()  # as for restart; the tasks stay active and resume on the next start
     await admin.shutdown()
     return {"stopping": True}
@@ -583,6 +588,77 @@ async def events(ws: WebSocket) -> None:
         pass
     finally:
         bus.clients.discard(ws)
+
+
+def terminal_client_allowed(client_host: str | None) -> bool:
+    """A terminal is a shell on this computer, so by default only this computer gets one. Remote devices
+    (already signed in, see signed_in) only with remote access on and terminal.allow_remote set."""
+    if client_host in LOOPBACK:
+        return True
+    return config.remote.enabled and config.terminal.allow_remote
+
+
+@app.websocket("/api/terminal/ws")
+async def terminal_ws(ws: WebSocket) -> None:
+    """A shell in ?repo= (with ?task=, its worktree; no repo: the scratch dir), keyed by the client's ?id=.
+
+    Binary frames carry terminal bytes both ways (UTF-8 text input from the client); the client also
+    sends {type: resize, cols, rows} and {type: binary, data} (raw input bytes as latin-1) as text,
+    and the server sends {type: exit, code} or {type: error, message} before closing.
+    """
+    host = ws.headers.get("host")
+    # The same checks as /api/ws: any web page could otherwise open a shell on this computer.
+    if (not host_allowed(host, config.remote.enabled) or not same_origin(ws.headers.get("origin") or "missing", host)
+            or not signed_in(ws.cookies)):
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    params = ws.query_params
+    key = params.get("id", "")[:64]
+    try:
+        if not terminal_client_allowed(ws.client.host if ws.client else None):
+            raise TerminalError("terminals open on this computer only (see terminal.allow_remote in config.yaml)")
+        if not key:
+            raise TerminalError("missing terminal id")
+        cwd = terminal.resolve_cwd(config, store, params.get("repo") or None, params.get("task") or None)
+        session = await terminals.open(key, terminal.shell_command(config.terminal.shell), cwd,
+                                       int(params.get("cols", 80)), int(params.get("rows", 24)))
+    except (TerminalError, WorkspaceError, ValueError) as exc:
+        await ws.send_json({"type": "error", "message": str(exc)})
+        await ws.close(code=1008)
+        return
+
+    async def forward_output() -> None:
+        try:
+            while (data := await session.read()) is not None:
+                await ws.send_bytes(data)
+            await ws.send_json({"type": "exit", "code": session.exit_code()})
+            await ws.close()
+        except (WebSocketDisconnect, RuntimeError, OSError):
+            pass  # the browser went away first; the receive loop below cleans up
+
+    output = asyncio.create_task(forward_output())
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg["type"] == "websocket.disconnect":
+                break
+            if msg.get("bytes"):
+                session.write(msg["bytes"])
+            elif msg.get("text"):
+                try:
+                    control = json.loads(msg["text"])
+                    if control.get("type") == "resize":
+                        session.resize(int(control["cols"]), int(control["rows"]))
+                    elif control.get("type") == "binary":  # raw bytes, one per character (xterm.js onBinary)
+                        session.write(str(control["data"]).encode("latin-1"), binary=True)
+                except (KeyError, TypeError, AttributeError, ValueError):
+                    pass  # a malformed control message is ignored, not fatal
+    except (WebSocketDisconnect, RuntimeError):  # RuntimeError: receive() after the socket closed
+        pass
+    finally:
+        output.cancel()
+        await terminals.close(key, session)
 
 
 def _not_found(what: str):

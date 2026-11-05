@@ -64,6 +64,15 @@ class Notifications(BaseModel):
     ntfy_server: str = "https://ntfy.sh"
 
 
+class TerminalSettings(BaseModel):
+    # The integrated terminal's shell: a program (path or name on PATH), or a list of program and
+    # arguments. Unset: PowerShell on Windows (pwsh if installed), else $SHELL or /bin/bash.
+    shell: str | list[str] | None = None
+    # Terminals are refused to devices other than this computer. True lets devices signed in through
+    # remote access open them too: anyone with the access token then gets a shell on this computer.
+    allow_remote: bool = False
+
+
 class Config(BaseModel):
     repos: list[Repo] = Field(default_factory=list)
     models: Models = Field(default_factory=Models)
@@ -73,6 +82,7 @@ class Config(BaseModel):
     port: int = 8000
     remote: Remote = Field(default_factory=Remote)
     notifications: Notifications = Field(default_factory=Notifications)
+    terminal: TerminalSettings = Field(default_factory=TerminalSettings)
     # "subscription": always use your claude.ai plan login (API keys in the environment are ignored).
     # "api": allow ANTHROPIC_API_KEY to be used, billed to your Claude Platform account.
     # true: commits, pushes, PRs, installs and edits to config/guards run without prompting. Merging a PR
