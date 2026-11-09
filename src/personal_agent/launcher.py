@@ -11,6 +11,7 @@ Vivaldi) it uses app mode, a standalone window without tabs or an address bar.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -29,7 +30,7 @@ CHROME_PATHS = [
 ]
 LOG_PATH = DATA_DIR / "logs" / "server.log"
 BROWSER_PROFILE = DATA_DIR / "browser"
-ICON_PNG =PROJECT_ROOT / "frontend" / "public" / "icon-512.png"
+ICON_PNG = PROJECT_ROOT / "frontend" / "public" / "icon-512.png"
 ICON_ICO = DATA_DIR / "icon.ico"
 
 
@@ -89,12 +90,21 @@ def default_browser() -> Path | None:
         return None
 
 
-def installed_app_id() -> str | None:
-    """The id of this app once installed from the app window's menu (Install Personal Agent)."""
+def web_app_id(manifest_id: str) -> str:
+    """Chromium's id for a web app: the first 128 bits of SHA-256 of its manifest id, in hex digits a-p."""
+    digest = hashlib.sha256(manifest_id.encode()).hexdigest()[:32]
+    return "".join(chr(ord("a") + int(c, 16)) for c in digest)
+
+
+def installed_app_id(url: str) -> str | None:
+    """The id of this app if it was installed from the app window's menu (Install Personal Agent).
+
+    The profile also holds apps Chrome preinstalls (Google Drive, Docs, Gmail, YouTube...), so look for
+    this app's own id. Its manifest has no "id", so Chrome derives it from start_url ("/").
+    """
+    app_id = web_app_id(f"{url.rstrip('/')}/")
     resources = BROWSER_PROFILE / "Default" / "Web Applications" / "Manifest Resources"
-    if not resources.is_dir():
-        return None
-    return next((p.name for p in resources.iterdir() if p.is_dir()), None)
+    return app_id if (resources / app_id).is_dir() else None
 
 
 def open_app(url: str, tab: bool = False) -> None:
@@ -105,7 +115,7 @@ def open_app(url: str, tab: bool = False) -> None:
         # A dedicated profile makes this its own browser process: a window handed to an already running
         # browser ignores --start-maximized, and only an installed app (see installed_app_id) pins with
         # its own icon instead of the browser's.
-        app_id = installed_app_id()
+        app_id = installed_app_id(url)
         target = f"--app-id={app_id}" if app_id else f"--app={url}"
         subprocess.Popen([str(browser), f"--user-data-dir={BROWSER_PROFILE}", target, "--start-maximized"])
     elif browser and browser.exists():
