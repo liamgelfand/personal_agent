@@ -46,9 +46,15 @@ python -m uv run python -m personal_agent.launcher --install-shortcut
 
 This adds a "Personal Agent" shortcut to your Desktop and Start menu. It starts the server in
 the background (no terminal; output goes to `data/logs/server.log`) if it isn't already running,
-then opens the app in your default browser: as a standalone app window for Chrome, Edge, Brave,
-and Vivaldi, or a normal tab otherwise. Opening it again reuses the running server. To stop the
-server: `python -m uv run python -m personal_agent.launcher --stop`.
+then opens the app maximized in its own window (pywebview on Edge WebView2, which Windows 11
+includes). Right-click its taskbar button and choose "Pin to taskbar" to keep it there with its
+own icon. Opening it again while the window is open brings that window to the front. Closing the
+window leaves the server running so agents keep working. To stop the server:
+`python -m uv run python -m personal_agent.launcher --stop`. To open the app in a browser tab
+instead, add `--tab`.
+
+Rerun `--install-shortcut` after moving the project: the shortcut and the window share an
+AppUserModelID (`LiamGelfand.PersonalAgent`), which is how the taskbar pins the window as this app.
 For UI development with hot reload, also run `cd frontend && npm run dev` and open
 http://127.0.0.1:5173.
 

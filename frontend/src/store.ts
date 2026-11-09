@@ -85,7 +85,16 @@ async function liveChatTabs(ids: string[], conversations: Conversation[]) {
   return { gone, found }
 }
 
-export type TerminalRef = { id: string; repo: string | null; task: string | null; title: string }
+// A chat that was opened but never used is deleted when the user leaves it, rather than lingering blank.
+const discarding = new Set<string>()
+function discardIfBlank(id: string | null) {
+  const s = useApp.getState()
+  if (!id || discarding.has(id) || !loadedConvs.has(id) || s.busyConvs[id] || s.convEvents[id]?.length !== 0) return
+  discarding.add(id)
+  api.deleteConversation(id).catch(() => {}).finally(() => discarding.delete(id))
+}
+
+export type TerminalRef ={ id: string; repo: string | null; task: string | null; title: string }
 
 type ReviewState = { review: Review | null; running: boolean; progress: string[] }
 
@@ -226,6 +235,8 @@ export const useApp = create<State>((set, get) => ({
   },
 
   async openConversation(id, refetch = false) {
+    const previous = get().activeConv
+    if (previous !== id) discardIfBlank(previous)
     set((s) => {
       const unseenConvs = { ...s.unseenConvs }
       delete unseenConvs[id]
@@ -242,8 +253,10 @@ export const useApp = create<State>((set, get) => ({
   },
 
   async newConversation(repo, mode = 'agent') {
+    const previous = get().activeConv
     const conv = await api.createConversation(repo, mode)
     loadedConvs.add(conv.id)
+    discardIfBlank(previous)
     set((s) => ({
       conversations: s.conversations.some((c) => c.id === conv.id) ? s.conversations : [conv, ...s.conversations],
       activeConv: conv.id,
@@ -254,6 +267,7 @@ export const useApp = create<State>((set, get) => ({
 
   async closeChatTab(id) {
     const s = get()
+    discardIfBlank(id)
     const next = chatTabList.closeChatTab({ ids: s.chatTabs, active: s.activeConv }, id)
     set({ chatTabs: next.ids })
     if (next.active === s.activeConv) return

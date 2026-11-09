@@ -197,7 +197,7 @@ def open_url(body: OpenUrl, request: Request) -> dict:
         raise HTTPException(400, "only http and https links can be opened")
     if request.client is None or request.client.host not in LOOPBACK:
         raise HTTPException(403, "links open on this computer only; open it on your device instead")
-    launcher.open_app(body.url, tab=True)
+    launcher.open_in_browser(body.url)
     return {"ok": True}
 
 
