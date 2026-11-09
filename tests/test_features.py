@@ -490,7 +490,7 @@ def test_open_url_accepts_web_links_only(monkeypatch):
 
     local, phone = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")), SimpleNamespace(client=SimpleNamespace(host="100.64.0.5"))
     opened = []
-    monkeypatch.setattr(server.launcher, "open_app", lambda url, tab=False: opened.append((url, tab)))
+    monkeypatch.setattr(server.launcher, "open_in_browser", opened.append)
     assert server.open_url(server.OpenUrl(url="https://example.com/a?b=1"), local) == {"ok": True}
     assert server.open_url(server.OpenUrl(url="HTTP://example.com"), local)
     for url in ("javascript:alert(1)", "file:///C:/Windows/win.ini", "ms-settings:", "http:no-host", "/relative", ""):
@@ -500,7 +500,7 @@ def test_open_url_accepts_web_links_only(monkeypatch):
     with pytest.raises(HTTPException) as exc:  # a phone must not open tabs on this computer
         server.open_url(server.OpenUrl(url="https://example.com"), phone)
     assert exc.value.status_code == 403
-    assert opened == [("https://example.com/a?b=1", True), ("HTTP://example.com", True)]
+    assert opened == ["https://example.com/a?b=1", "HTTP://example.com"]
 
 
 def test_open_url_rejects_cross_origin_posts(monkeypatch):
@@ -509,7 +509,7 @@ def test_open_url_rejects_cross_origin_posts(monkeypatch):
     from personal_agent import server
 
     opened = []
-    monkeypatch.setattr(server.launcher, "open_app", lambda url, tab=False: opened.append(url))
+    monkeypatch.setattr(server.launcher, "open_in_browser", opened.append)
     client = TestClient(server.app, client=("127.0.0.1", 50000))
     host = "127.0.0.1:8000"  # an allowed host, so only the Origin decides
     response = client.post("/api/open-url", json={"url": "https://example.com"},

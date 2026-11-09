@@ -1,7 +1,9 @@
-"""Desktop launcher: start the server in the background if needed, then open the app.
+"""Desktop launcher: start the server in the background if needed, then open the app in its own window.
 
-Opens in your default browser. When that browser is Chromium-based (Chrome, Edge, Brave,
-Vivaldi) it uses app mode, a standalone window without tabs or an address bar.
+The window is pywebview on Edge WebView2 (built into Windows 11), not a browser, so it has the app's
+own icon, opens maximized, and pins to the taskbar as Personal Agent. Closing the window leaves the
+server running, so agents keep working; launching again reuses it. Only one window runs at a time:
+launching again brings the open one to the front.
 
     personal-agent-app                     open the app (starting the server if needed)
     personal-agent-app --tab               open in a normal browser tab instead
@@ -11,7 +13,7 @@ Vivaldi) it uses app mode, a standalone window without tabs or an address bar.
 
 from __future__ import annotations
 
-import hashlib
+import ctypes
 import os
 import shutil
 import subprocess
@@ -23,13 +25,14 @@ from pathlib import Path
 
 from .config import DATA_DIR, PROJECT_ROOT, load_config
 
-APP_MODE_BROWSERS = {"chrome.exe", "msedge.exe", "brave.exe", "vivaldi.exe"}
-CHROME_PATHS = [
-    Path(os.environ.get(var, "")) / "Google" / "Chrome" / "Application" / "chrome.exe"
-    for var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")
-]
+APP_NAME = "Personal Agent"
+# Ties the window and the shortcuts together, so the taskbar groups and pins them as one app with the
+# shortcut's icon (rather than as pythonw.exe with Python's).
+APP_USER_MODEL_ID = "LiamGelfand.PersonalAgent"
+MUTEX_NAME = "Local\\personal-agent-window"
 LOG_PATH = DATA_DIR / "logs" / "server.log"
-BROWSER_PROFILE = DATA_DIR / "browser"
+# Cookies and localStorage persist here between launches.
+WEBVIEW_DIR = DATA_DIR / "webview"
 ICON_PNG = PROJECT_ROOT / "frontend" / "public" / "icon-512.png"
 ICON_ICO = DATA_DIR / "icon.ico"
 
@@ -72,56 +75,9 @@ def wait_for_server(timeout: float = 60) -> bool:
     return False
 
 
-def default_browser() -> Path | None:
-    """The default browser's executable on Windows, read from the http URL association."""
-    if os.name != "nt":
-        return None
-    import shlex
-    import winreg
-
-    try:
-        key = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice"
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
-            prog_id = winreg.QueryValueEx(k, "ProgId")[0]
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"{prog_id}\shell\open\command") as k:
-            command = winreg.QueryValueEx(k, "")[0]
-        return Path(shlex.split(command, posix=False)[0].strip('"'))
-    except (OSError, IndexError, ValueError):
-        return None
-
-
-def web_app_id(manifest_id: str) -> str:
-    """Chromium's id for a web app: the first 128 bits of SHA-256 of its manifest id, in hex digits a-p."""
-    digest = hashlib.sha256(manifest_id.encode()).hexdigest()[:32]
-    return "".join(chr(ord("a") + int(c, 16)) for c in digest)
-
-
-def installed_app_id(url: str) -> str | None:
-    """The id of this app if it was installed from the app window's menu (Install Personal Agent).
-
-    The profile also holds apps Chrome preinstalls (Google Drive, Docs, Gmail, YouTube...), so look for
-    this app's own id. Its manifest has no "id", so Chrome derives it from start_url ("/").
-    """
-    app_id = web_app_id(f"{url.rstrip('/')}/")
-    resources = BROWSER_PROFILE / "Default" / "Web Applications" / "Manifest Resources"
-    return app_id if (resources / app_id).is_dir() else None
-
-
-def open_app(url: str, tab: bool = False) -> None:
-    browser = default_browser()
-    if browser is None or not browser.exists():
-        browser = next((p for p in CHROME_PATHS if p.exists()), None)  # fall back to Chrome
-    if not tab and browser and browser.name.lower() in APP_MODE_BROWSERS:
-        # A dedicated profile makes this its own browser process: a window handed to an already running
-        # browser ignores --start-maximized, and only an installed app (see installed_app_id) pins with
-        # its own icon instead of the browser's.
-        app_id = installed_app_id(url)
-        target = f"--app-id={app_id}" if app_id else f"--app={url}"
-        subprocess.Popen([str(browser), f"--user-data-dir={BROWSER_PROFILE}", target, "--start-maximized"])
-    elif browser and browser.exists():
-        subprocess.Popen([str(browser), url])
-    else:
-        webbrowser.open(url)
+def open_in_browser(url: str) -> None:
+    """Open a link in the default browser."""
+    webbrowser.open(url)
 
 
 def stop_server() -> bool:
@@ -134,6 +90,78 @@ def stop_server() -> bool:
     except OSError:
         return False
 
+
+# --- the app window ---------------------------------------------------------------------------
+
+def _single_instance():
+    """A named mutex held while the window is open, or None when another copy already holds it."""
+    if os.name != "nt":
+        return object()
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    handle = kernel32.CreateMutexW(None, True, MUTEX_NAME)
+    if handle and ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        return None
+    return handle  # released by Windows when this process exits
+
+
+def focus_existing_window() -> bool:
+    """Restore and bring the open app window to the front. Matches only WinForms windows (what
+    pywebview creates), so an Explorer window on a folder named "Personal Agent" isn't picked."""
+    if os.name != "nt":
+        return False
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    found: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def visit(hwnd, _lparam):
+        title, cls = ctypes.create_unicode_buffer(256), ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, title, 256)
+        user32.GetClassNameW(hwnd, cls, 256)
+        if title.value == APP_NAME and cls.value.startswith("WindowsForms"):
+            found.append(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(visit, 0)
+    if not found:
+        return False
+    if user32.IsIconic(found[0]):
+        user32.ShowWindow(found[0], 9)  # SW_RESTORE
+    user32.SetForegroundWindow(found[0])
+    return True
+
+
+def _tag_window(hwnd: int) -> None:
+    """Give the window itself the app's AppUserModelID too, so the taskbar matches it to the shortcut."""
+    import pythoncom
+    from win32com.propsys import propsys, pscon
+
+    store = propsys.SHGetPropertyStoreForWindow(hwnd, propsys.IID_IPropertyStore)
+    store.SetValue(pscon.PKEY_AppUserModel_ID, propsys.PROPVARIANTType(APP_USER_MODEL_ID, pythoncom.VT_LPWSTR))
+
+
+def run_window(url: str) -> None:
+    import webview
+
+    if os.name == "nt":
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    if not ICON_ICO.exists():
+        _write_ico(ICON_PNG, ICON_ICO)
+    # Links that open a new window (target=_blank, window.open) go to the default browser.
+    window = webview.create_window(APP_NAME, url, maximized=True, min_size=(800, 560), text_select=True,
+                                   background_color="#0b0c0e")
+    if os.name == "nt":
+        window.events.shown += lambda: _tag_window(window.native.Handle.ToInt64())
+    webview.start(private_mode=False, storage_path=str(WEBVIEW_DIR), icon=str(ICON_ICO))
+
+
+# --- shortcuts --------------------------------------------------------------------------------
 
 def _write_ico(png: Path, ico: Path) -> None:
     """Wrap a PNG in an .ico container (Windows accepts PNG-compressed icon images)."""
@@ -150,29 +178,35 @@ def _write_ico(png: Path, ico: Path) -> None:
 def install_shortcuts() -> list[str]:
     if os.name != "nt":
         raise SystemExit("Shortcuts are only set up automatically on Windows.")
+    import pythoncom
+    from win32com.client import Dispatch
+    from win32com.propsys import propsys, pscon
+    from win32com.shell import shellcon
+
     target = shutil.which("personal-agent-app") or str(Path(sys.executable).parent / "personal-agent-app.exe")
     _write_ico(ICON_PNG, ICON_ICO)
-    script = f"""
-$shell = New-Object -ComObject WScript.Shell
-foreach ($folder in @($shell.SpecialFolders('Desktop'), $shell.SpecialFolders('Programs'))) {{
-  $link = $shell.CreateShortcut((Join-Path $folder 'Personal Agent.lnk'))
-  $link.TargetPath = '{target}'
-  $link.WorkingDirectory = '{PROJECT_ROOT}'
-  $link.IconLocation = '{ICON_ICO}'
-  $link.Description = 'Open Personal Agent'
-  $link.Save()
-  Write-Output $link.FullName
-}}"""
-    out = subprocess.run(["powershell", "-NoProfile", "-Command", script], capture_output=True, text=True, check=True)
-    return [line for line in out.stdout.splitlines() if line.strip()]
+    shell = Dispatch("WScript.Shell")
+    paths = []
+    for folder in ("Desktop", "Programs"):
+        path = str(Path(shell.SpecialFolders(folder)) / f"{APP_NAME}.lnk")
+        link = shell.CreateShortcut(path)
+        link.TargetPath = target
+        link.WorkingDirectory = str(PROJECT_ROOT)
+        link.IconLocation = f"{ICON_ICO},0"
+        link.Description = f"Open {APP_NAME}"
+        link.Save()
+        # The same AppUserModelID as the window: the taskbar then shows and pins the window as this shortcut.
+        store = propsys.SHGetPropertyStoreFromParsingName(path, None, shellcon.GPS_READWRITE, propsys.IID_IPropertyStore)
+        store.SetValue(pscon.PKEY_AppUserModel_ID, propsys.PROPVARIANTType(APP_USER_MODEL_ID, pythoncom.VT_LPWSTR))
+        store.Commit()
+        paths.append(path)
+    return paths
 
 
 def _message(text: str) -> None:
     """Show an error even when started without a console (from a shortcut)."""
     if os.name == "nt" and Path(sys.executable).name.lower().startswith("pythonw"):
-        import ctypes
-
-        ctypes.windll.user32.MessageBoxW(None, text, "Personal Agent", 0x10)
+        ctypes.windll.user32.MessageBoxW(None, text, APP_NAME, 0x10)
     else:
         print(text, file=sys.stderr)
 
@@ -186,12 +220,19 @@ def main() -> None:
     if "--stop" in args:
         print("Stopped." if stop_server() else "The server was not running.")
         return
+    tab = "--tab" in args
+    if not tab and _single_instance() is None:
+        if focus_existing_window():
+            return
     if not server_running():
         start_server()
         if not wait_for_server():
             _message(f"The server did not start. See {LOG_PATH}")
             sys.exit(1)
-    open_app(_base_url(), tab="--tab" in args)
+    if tab:
+        open_in_browser(_base_url())
+    else:
+        run_window(_base_url())
 
 
 if __name__ == "__main__":
