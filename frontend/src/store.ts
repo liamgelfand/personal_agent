@@ -154,6 +154,8 @@ type State = {
   dismissTask: (id: string) => void
   openTab: (tab: Tab) => void
   closeTab: (id: string) => void
+  // After a rename (to) or delete (to = null) of `from` in the explorer: file tabs under it follow, diffs close.
+  moveTabs: (ws: WorkspaceRef, from: string, to: string | null) => void
   setDirty: (id: string, dirty: boolean) => void
   loadReview: (ws: WorkspaceRef) => Promise<void>
   showError: (err: unknown) => void
@@ -309,6 +311,37 @@ export const useApp = create<State>((set, get) => ({
       const activeTab = s.activeTab === id ? (tabs[Math.max(0, index - 1)]?.id ?? null) : s.activeTab
       const dirtyTabs = { ...s.dirtyTabs }
       delete dirtyTabs[id]
+      return { tabs, activeTab, dirtyTabs }
+    })
+  },
+
+  moveTabs(ws, from, to) {
+    const key = wsKey(ws)
+    const under = (t: Tab): t is Extract<Tab, { kind: 'file' | 'diff' }> =>
+      t.kind !== 'task' && wsKey(t.ws) === key && (t.path === from || t.path.startsWith(`${from}/`))
+    const ids = new Map<string, string | null>()
+    const tabs: Tab[] = []
+    for (const t of get().tabs) {
+      if (!under(t)) {
+        tabs.push(t)
+      } else if (to !== null && t.kind === 'file') {
+        const path = to + t.path.slice(from.length)
+        const moved = { ...t, path, id: tabId.file(ws, path), line: undefined }
+        ids.set(t.id, moved.id)
+        if (!tabs.some((o) => o.id === moved.id)) tabs.push(moved)
+      } else {
+        ids.set(t.id, null)
+      }
+    }
+    if (!ids.size) return
+    set((s) => {
+      const dirtyTabs = { ...s.dirtyTabs }
+      for (const id of ids.keys()) delete dirtyTabs[id]
+      let activeTab = s.activeTab
+      if (activeTab && ids.has(activeTab)) {
+        const index = s.tabs.findIndex((t) => t.id === activeTab)
+        activeTab = ids.get(activeTab) ?? tabs[Math.max(0, Math.min(index, tabs.length) - 1)]?.id ?? null
+      }
       return { tabs, activeTab, dirtyTabs }
     })
   },

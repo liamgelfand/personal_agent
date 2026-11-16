@@ -192,6 +192,32 @@ svg { flex-shrink: 0; }
 .tree-row.dir { color: var(--text); }
 .tree-row .chev { color: var(--text-3); }
 .tree-row .label { overflow: hidden; text-overflow: ellipsis; }
+.tree-row.selected:not(.active) { background: var(--surface-2); }
+.tree:focus { outline: none; }
+.explorer-bar { display: flex; align-items: center; gap: 2px; padding: 8px 6px 8px 8px; }
+.explorer-bar .filter { flex: 1; min-width: 0; margin: 0 4px 0 0; width: auto; }
+.explorer-bar .icon-btn:disabled { opacity: 0.4; }
+.tree-edit { position: relative; display: flex; align-items: center; gap: 4px; height: 24px; padding-right: 4px; }
+.tree-edit .chev { color: var(--text-3); flex-shrink: 0; }
+.tree-edit input { flex: 1; min-width: 0; height: 22px; padding: 0 6px; font-size: 12.5px; }
+.tree-edit input.invalid { border-color: var(--danger); box-shadow: none; }
+.tree-edit-error {
+  position: absolute; left: 0; right: 4px; top: 100%; z-index: 10; padding: 4px 8px; margin-top: -1px;
+  font-size: 12px; color: var(--text); background: var(--surface); border: 1px solid var(--danger); border-radius: 4px;
+}
+.context-menu {
+  position: fixed; z-index: 80; min-width: 170px; padding: 4px; display: flex; flex-direction: column;
+  background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-lg); box-shadow: var(--overlay-shadow);
+}
+.context-menu button {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px; height: 26px; padding: 0 10px;
+  border-radius: 4px; font-size: 12.5px; text-align: left; color: var(--text);
+}
+.context-menu button:hover:not(:disabled) { background: var(--surface-3); }
+.context-menu button:disabled { color: var(--text-3); }
+.context-menu button.danger:not(:disabled) { color: var(--danger); }
+.context-menu .faint { font-size: 11.5px; }
+.context-sep { height: 1px; margin: 4px 2px; background: var(--border); }
 
 .section-title {
   display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 12px; margin-top: 8px;
