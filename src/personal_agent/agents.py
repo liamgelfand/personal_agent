@@ -9,6 +9,10 @@ from .config import PROJECT_ROOT, Models
 
 AGENTS_DIR = PROJECT_ROOT / "agents"
 
+# Claude Code adds a "Co-Authored-By" commit trailer and a "Generated with Claude Code" PR footer by
+# default. The agents only load project settings, so your user-level settings never apply; this does.
+NO_ATTRIBUTION = '{"attribution": {"commit": "", "pr": ""}, "includeCoAuthoredBy": false}'
+
 ORCHESTRATOR_PROMPT = """\
 You are the orchestrator of a personal engineering agent system. The user chats with you in
 a web IDE. Each conversation is either linked to one of their repositories (your working

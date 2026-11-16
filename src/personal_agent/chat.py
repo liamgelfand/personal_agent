@@ -13,6 +13,7 @@ from typing import Any
 from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server, get_session_messages, tool
 
 from .agents import (
+    NO_ATTRIBUTION,
     CHAT_MODE_PROMPT, CONTEXT_READ_ONLY, CONTEXT_REPO, CONTEXT_SCRATCH, ORCHESTRATOR_PROMPT, chat_subagents,
 )
 from .bus import Bus
@@ -245,6 +246,7 @@ class ChatManager:
             cwd=cwd,
             add_dirs=[r.path for r in self.config.repos if r.path != cwd],
             setting_sources=["project"],
+            settings=NO_ATTRIBUTION,
             model=self.config.models.orchestrator,
             max_turns=self.config.max_turns,
             include_partial_messages=True,

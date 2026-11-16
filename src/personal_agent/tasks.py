@@ -20,7 +20,7 @@ from typing import Any
 from claude_agent_sdk import ClaudeAgentOptions
 
 from . import bootstrap, gitops
-from .agents import load_agent
+from .agents import NO_ATTRIBUTION, load_agent
 from .bus import Bus
 from .config import WORKTREES_DIR, Access, Config
 from .guards import approval_detail, guard_hook
@@ -48,7 +48,6 @@ RESTART_NOTE = (
 )
 
 
-CO_AUTHOR = "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
 VERIFY_SECTION = re.compile(r"^\s*(?:#+\s*)?verify\b", re.IGNORECASE | re.MULTILINE)
 
 # New files with these names are never committed and pushed by the finish step.
@@ -297,7 +296,7 @@ class TaskManager:
                 )
             if files:
                 await gitops.stage(worktree, ["."])
-                await gitops.commit(worktree, f"{task['title']}\n\nTask {task_id}\n\n{CO_AUTHOR}")
+                await gitops.commit(worktree, f"{task['title']}\n\nTask {task_id}")
             if await gitops.head_sha(worktree) == task["base_sha"]:
                 raise RuntimeError("the task made no changes, so there is nothing to push")
             # An explicit refspec, so the push can only ever update the task's own branch.
@@ -340,7 +339,7 @@ class TaskManager:
             parts.append("**The final review still has open findings:**" + "".join(chr(10) + f for f in open_findings))
         if VERIFY_SECTION.search(task["spec"]):
             parts.append("How to test: follow the Verify section above.")
-        return "\n\n".join([*parts, "🤖 Generated with [Claude Code](https://claude.com/claude-code)"])
+        return "\n\n".join(parts)
 
     def _implementer_options(self, ws, session_id: str | None) -> ClaudeAgentOptions:
         scope = {"task_id": ws.task_id}
@@ -361,6 +360,7 @@ class TaskManager:
                 bootstrap.dependency_link_hook(ws.path, lambda links, command: self._unlinked(ws.task_id, links, command)),
             ]},
             setting_sources=["project"],
+            settings=NO_ATTRIBUTION,
             max_turns=self.config.max_turns,
             resume=session_id,
         )

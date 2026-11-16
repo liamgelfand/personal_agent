@@ -232,12 +232,12 @@ async def test_finish_commits_pushes_and_opens_pr(finishing):
     assert (await gitops.status(wt))["files"] == []
     message = await gitops.git(wt, "log", "-1", "--format=%B")
     assert message.startswith("Change greeting\n\nTask t1\n")
-    assert message.strip().endswith("Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>")
+    assert "Co-Authored-By" not in message
     create = next(c for c in f.gh_calls if c[1] == "create")
     assert create[create.index("--base") + 1] == "main" and create[create.index("--head") + 1] == "agent/greet"
     body = create[create.index("--body") + 1]
     assert "Do it." in body and "Looks good (0 findings)" in body and "How to test" in body
-    assert body.endswith("🤖 Generated with [Claude Code](https://claude.com/claude-code)")
+    assert "Generated with" not in body
     finished = [e for e in f.store.events(task_id="t1") if e["type"] == "finished"]
     assert finished and finished[0]["url"] == task["pr_url"]
 
