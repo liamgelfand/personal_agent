@@ -154,6 +154,9 @@ function History({ onPick }: { onPick: () => void }) {
   )
 }
 
+// Unsent composer text per conversation, so it survives switching chats.
+const drafts = new Map<string, string>()
+
 function ConversationView({ id }: { id: string }) {
   const conv = useApp((s) => s.convCache[id])
   const events = useApp((s) => s.convEvents[id])
@@ -161,7 +164,12 @@ function ConversationView({ id }: { id: string }) {
   const busy = useApp((s) => !!s.busyConvs[id])
   const repos = useApp((s) => s.repos)
   const showError = useApp((s) => s.showError)
-  const [draft, setDraft] = useState('')
+  const [draft, setDraftState] = useState(() => drafts.get(id) ?? '')
+  const setDraft = (text: string) => {
+    if (text) drafts.set(id, text)
+    else drafts.delete(id)
+    setDraftState(text)
+  }
   const bottom = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLTextAreaElement>(null)
   // @mentions: the repo's files, and the "@query" being typed at the caret (if any).
@@ -181,6 +189,16 @@ function ConversationView({ id }: { id: string }) {
     let n = 0
     return (events ?? []).map((e) => (e.type === 'user' ? n++ : -1))
   }, [events])
+
+  // Memoized so typing in the composer doesn't re-render (and re-parse the markdown of)
+  // every past message; that made long chats lag on each keystroke.
+  const transcript = useMemo(
+    () =>
+      (events ?? []).map((e, i) => (
+        <EventView key={i} event={e} edit={userIndex[i] >= 0 ? { convId: id, index: userIndex[i] } : undefined} />
+      )),
+    [events, userIndex, id],
+  )
 
   // Block body on purpose: newer Chrome returns a Promise from scrollIntoView, and React
   // would treat any returned value as a cleanup function and crash calling it.
@@ -272,9 +290,7 @@ function ConversationView({ id }: { id: string }) {
                 : 'Agent mode with no repo. Link a repo above to work on code.'}
           </p>
         )}
-        {(events ?? []).map((e, i) => (
-          <EventView key={i} event={e} edit={userIndex[i] >= 0 ? { convId: id, index: userIndex[i] } : undefined} />
-        ))}
+        {transcript}
         {streaming && (
           <div className="msg-text streaming-caret">
             <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{streaming}</Markdown>
