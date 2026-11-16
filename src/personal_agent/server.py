@@ -30,7 +30,9 @@ from .store import Store
 from .tasks import TaskManager
 from .terminal import Terminals, TerminalError
 from .watcher import watch
-from .workspace import WorkspaceError, get_workspace, list_files, read_file, search, write_file
+from .workspace import (
+    WorkspaceError, create_entry, delete_entry, get_workspace, list_entries, read_file, rename_entry, search, write_file,
+)
 
 # The Vite dev server proxies to us from another port on this machine.
 DEV_ORIGINS = {"http://127.0.0.1:5173", "http://localhost:5173"}
@@ -456,11 +458,21 @@ class FileWrite(BaseModel):
     content: str
 
 
+class EntryCreate(BaseModel):
+    path: str
+    dir: bool = False
+
+
+class EntryRename(BaseModel):
+    path: str
+    new_path: str
+
+
 @app.get("/api/fs/tree")
 async def tree(repo: str, task: str | None = None) -> dict:
     ws = get_workspace(config, store, repo, task)
-    files, truncated = await list_files(ws)
-    return {"root": str(ws.path), "access": ws.access.value, "files": files, "truncated": truncated}
+    files, dirs, truncated = await list_entries(ws)
+    return {"root": str(ws.path), "access": ws.access.value, "files": files, "dirs": dirs, "truncated": truncated}
 
 
 @app.get("/api/fs/file")
@@ -471,6 +483,32 @@ def get_file(repo: str, path: str, task: str | None = None) -> dict:
 @app.put("/api/fs/file")
 def put_file(repo: str, path: str, body: FileWrite, task: str | None = None) -> dict:
     write_file(get_workspace(config, store, repo, task), path, body.content)
+    return {"ok": True}
+
+
+async def _fs_changed(repo: str, task: str | None) -> None:
+    """Tell clients now rather than after the watcher's debounce."""
+    await bus.publish({"type": "fs_changed", "repo": repo, "task": task})
+
+
+@app.post("/api/fs/entry")
+async def create_fs_entry(repo: str, body: EntryCreate, task: str | None = None) -> dict:
+    await asyncio.to_thread(create_entry, get_workspace(config, store, repo, task), body.path, body.dir)
+    await _fs_changed(repo, task)
+    return {"ok": True}
+
+
+@app.post("/api/fs/rename")
+async def rename_fs_entry(repo: str, body: EntryRename, task: str | None = None) -> dict:
+    await asyncio.to_thread(rename_entry, get_workspace(config, store, repo, task), body.path, body.new_path)
+    await _fs_changed(repo, task)
+    return {"ok": True}
+
+
+@app.delete("/api/fs/entry")
+async def delete_fs_entry(repo: str, path: str, task: str | None = None) -> dict:
+    await asyncio.to_thread(delete_entry, get_workspace(config, store, repo, task), path)
+    await _fs_changed(repo, task)
     return {"ok": True}
 
 

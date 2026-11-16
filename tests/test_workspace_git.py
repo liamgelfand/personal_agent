@@ -6,7 +6,9 @@ import pytest
 from personal_agent import gitops
 from personal_agent.config import Access, Repo
 from personal_agent.store import Store
-from personal_agent.workspace import Workspace, WorkspaceError, list_files, read_file, write_file
+from personal_agent.workspace import (
+    Workspace, WorkspaceError, create_entry, delete_entry, list_entries, list_files, read_file, rename_entry, write_file,
+)
 
 
 def sh(cwd: Path, *args: str) -> None:
@@ -129,6 +131,137 @@ def test_write_preserves_crlf(repo):
     (repo / "win.txt").write_bytes(b"a\r\nb\r\n")
     write_file(ws(repo), "win.txt", "a\nb\nc\n")
     assert (repo / "win.txt").read_bytes() == b"a\r\nb\r\nc\r\n"
+
+
+async def test_list_entries_reports_empty_dirs(repo):
+    (repo / "empty" / "nested").mkdir(parents=True)
+    (repo / "full").mkdir()
+    (repo / "full" / "f.txt").write_text("x", newline="")
+    (repo / "node_modules").mkdir()
+    (repo / "node_modules" / "pkg").mkdir()
+    (repo / "node_modules" / "pkg" / "x.js").write_text("x", newline="")
+    (repo / "dist").mkdir()  # a fresh empty folder with a skipped name still shows; skipped dirs aren't walked into
+    assert await list_entries(ws(repo)) == ([".gitignore", "a.py", "full/f.txt"], ["dist", "empty/nested"], False)
+
+
+def test_create_rename_delete_entries(repo):
+    w = ws(repo)
+    create_entry(w, "src/new.py", is_dir=False)
+    assert (repo / "src" / "new.py").read_bytes() == b""
+    create_entry(w, "docs", is_dir=True)
+    assert (repo / "docs").is_dir()
+    rename_entry(w, "src/new.py", "docs/moved.py")
+    assert (repo / "docs" / "moved.py").is_file() and not (repo / "src" / "new.py").exists()
+    rename_entry(w, "a.py", "A.py")  # case-only rename, even where the filesystem ignores case
+    assert "A.py" in [p.name for p in repo.iterdir()]
+    delete_entry(w, "docs")
+    delete_entry(w, "A.py")
+    assert not (repo / "docs").exists() and not (repo / "A.py").exists()
+
+
+def test_entries_refuse_overwriting_existing_paths(repo):
+    w = ws(repo)
+    (repo / "sub").mkdir()
+    (repo / "sub" / "keep.txt").write_text("keep", newline="")
+    for rel, is_dir in (("a.py", False), ("a.py", True), ("sub", True), ("sub", False)):
+        with pytest.raises(WorkspaceError, match="already exists"):
+            create_entry(w, rel, is_dir)
+    with pytest.raises(WorkspaceError, match="already exists"):
+        rename_entry(w, "a.py", "sub/keep.txt")
+    with pytest.raises(WorkspaceError, match="into itself"):
+        rename_entry(w, "sub", "sub/inner")
+    assert (repo / "a.py").read_text() == "one\n" and (repo / "sub" / "keep.txt").read_text() == "keep"
+
+
+def test_entries_are_confined_to_the_workspace(repo, tmp_path):
+    w = ws(repo)
+    (tmp_path / "outside.txt").write_text("x", newline="")
+    for rel in ("../outside.txt", "../evil", "sub/../../evil", str(tmp_path / "evil"), "", ".", ".."):
+        with pytest.raises(WorkspaceError):
+            create_entry(w, rel, is_dir=False)
+        with pytest.raises(WorkspaceError):
+            delete_entry(w, rel)
+        with pytest.raises(WorkspaceError):
+            rename_entry(w, "a.py", rel)
+    with pytest.raises(WorkspaceError):
+        rename_entry(w, "../outside.txt", "stolen.txt")
+    # Windows ignores case and trailing dots/spaces, so these all name the real .git there.
+    for rel in (".git", ".git/config", ".git/hooks/x", ".GIT", ".Git.", ".git ", ".GIT/config", "sub/.GIT."):
+        with pytest.raises(WorkspaceError, match="git metadata"):
+            delete_entry(w, rel)
+        with pytest.raises(WorkspaceError, match="git metadata"):
+            rename_entry(w, rel, "moved")
+        with pytest.raises(WorkspaceError, match="git metadata"):
+            create_entry(w, rel, is_dir=True)
+    with pytest.raises(WorkspaceError, match="git metadata"):
+        write_file(w, ".GIT/config", "x")
+    with pytest.raises(WorkspaceError, match="git metadata"):
+        rename_entry(w, "a.py", ".git/a.py")
+    assert (tmp_path / "outside.txt").exists() and not (tmp_path / "evil").exists() and (repo / ".git").is_dir()
+
+
+def test_failed_rename_removes_the_folders_it_made(repo, monkeypatch):
+    def fail(self, target):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(Path, "rename", fail)
+    with pytest.raises(WorkspaceError, match="could not rename"):
+        rename_entry(ws(repo), "a.py", "new/deeper/a.py")
+    assert not (repo / "new").exists() and (repo / "a.py").exists()
+
+
+def test_entries_respect_read_only_access(repo):
+    r = ws(repo, Access.READ)
+    with pytest.raises(WorkspaceError, match="read-only"):
+        create_entry(r, "new.py", is_dir=False)
+    with pytest.raises(WorkspaceError, match="read-only"):
+        rename_entry(r, "a.py", "b.py")
+    with pytest.raises(WorkspaceError, match="read-only"):
+        delete_entry(r, "a.py")
+    assert sorted(p.name for p in repo.iterdir()) == [".git", ".gitignore", "a.py"]
+
+
+def test_fs_entry_endpoints(repo, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from personal_agent import server
+    from personal_agent.config import Config
+
+    monkeypatch.setattr(server, "config", Config(repos=[
+        Repo(name="r", path=repo.resolve(), access=Access.WRITE),
+        Repo(name="ro", path=repo.resolve(), access=Access.READ),
+    ]))
+    published = []
+
+    async def publish(event):
+        published.append(event)
+
+    monkeypatch.setattr(server.bus, "publish", publish)
+    client = TestClient(server.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50000))
+
+    assert client.post("/api/fs/entry?repo=r", json={"path": "pkg", "dir": True}).status_code == 200
+    assert client.post("/api/fs/entry?repo=r", json={"path": "pkg/mod.py"}).status_code == 200
+    assert (repo / "pkg" / "mod.py").is_file()
+    assert client.post("/api/fs/rename?repo=r", json={"path": "pkg/mod.py", "new_path": "pkg/main.py"}).status_code == 200
+    assert (repo / "pkg" / "main.py").is_file()
+    assert published[-1] == {"type": "fs_changed", "repo": "r", "task": None}
+
+    existing = client.post("/api/fs/entry?repo=r", json={"path": "a.py"})
+    assert existing.status_code == 400 and "already exists" in existing.json()["detail"]
+    clash = client.post("/api/fs/rename?repo=r", json={"path": "pkg/main.py", "new_path": "a.py"})
+    assert clash.status_code == 400 and (repo / "a.py").read_text() == "one\n"
+    for bad in (client.post("/api/fs/entry?repo=r", json={"path": "../escape.txt"}),
+                client.post("/api/fs/rename?repo=r", json={"path": "a.py", "new_path": "../escape.txt"}),
+                client.delete("/api/fs/entry", params={"repo": "r", "path": "../repo"})):
+        assert bad.status_code == 400 and "outside the workspace" in bad.json()["detail"]
+    assert not (repo.parent / "escape.txt").exists() and repo.exists()
+    read_only = client.post("/api/fs/entry?repo=ro", json={"path": "x.py"})
+    assert read_only.status_code == 400 and "read-only" in read_only.json()["detail"]
+
+    tree = client.get("/api/fs/tree?repo=r").json()
+    assert tree["files"] == [".gitignore", "a.py", "pkg/main.py"] and tree["dirs"] == []
+    assert client.delete("/api/fs/entry", params={"repo": "r", "path": "pkg"}).status_code == 200
+    assert not (repo / "pkg").exists()
 
 
 def test_store_conversations(tmp_path):

@@ -55,10 +55,15 @@ export const api = {
   discardTask: (id: string) => request('DELETE', `/api/tasks/${id}`),
 
   tree: (ws: WorkspaceRef) =>
-    request<{ root: string; access: string; files: string[] }>('GET', `/api/fs/tree?${wsQuery(ws)}`),
+    request<{ root: string; access: string; files: string[]; dirs: string[] }>('GET', `/api/fs/tree?${wsQuery(ws)}`),
   file: (ws: WorkspaceRef, path: string) => request<FileContent>('GET', `/api/fs/file?${wsQuery(ws, { path })}`),
   saveFile: (ws: WorkspaceRef, path: string, content: string) =>
     request('PUT', `/api/fs/file?${wsQuery(ws, { path })}`, { content }),
+  createEntry: (ws: WorkspaceRef, path: string, dir: boolean) =>
+    request('POST', `/api/fs/entry?${wsQuery(ws)}`, { path, dir }),
+  renameEntry: (ws: WorkspaceRef, path: string, newPath: string) =>
+    request('POST', `/api/fs/rename?${wsQuery(ws)}`, { path, new_path: newPath }),
+  deleteEntry: (ws: WorkspaceRef, path: string) => request('DELETE', `/api/fs/entry?${wsQuery(ws, { path })}`),
 
   status: (ws: WorkspaceRef) => request<GitStatus>('GET', `/api/git/status?${wsQuery(ws)}`),
   diff: (ws: WorkspaceRef, path: string, staged: boolean) =>
