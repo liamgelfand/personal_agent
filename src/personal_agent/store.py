@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     title TEXT NOT NULL,
     repo TEXT,                 -- NULL: not linked to a repo
     mode TEXT NOT NULL DEFAULT 'agent',  -- 'agent' (can change code) or 'chat' (discussion only)
+    projects TEXT NOT NULL DEFAULT '[]', -- JSON list of projects the chat has worked in (titles only)
+    title_locked INTEGER NOT NULL DEFAULT 0,  -- 1 once the user renamed it: titles stay theirs
     session_id TEXT,           -- Claude session to resume; cleared when the repo changes
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
@@ -86,9 +88,14 @@ class Store:
 
     def _migrate(self) -> None:
         columns = {r["name"] for r in self.db.execute("PRAGMA table_info(conversations)")}
-        if "mode" not in columns:
-            with self.db:
-                self.db.execute("ALTER TABLE conversations ADD COLUMN mode TEXT NOT NULL DEFAULT 'agent'")
+        for name, ddl in (
+            ("mode", "TEXT NOT NULL DEFAULT 'agent'"),
+            ("projects", "TEXT NOT NULL DEFAULT '[]'"),  # JSON list: projects the chat has worked in
+            ("title_locked", "INTEGER NOT NULL DEFAULT 0"),  # 1 once the user renames it: no auto titles
+        ):
+            if name not in columns:
+                with self.db:
+                    self.db.execute(f"ALTER TABLE conversations ADD COLUMN {name} {ddl}")
         task_columns = {r["name"] for r in self.db.execute("PRAGMA table_info(tasks)")}
         for name, ddl in (
             ("session_id", "TEXT"),
@@ -101,6 +108,13 @@ class Store:
             if name not in task_columns:
                 with self.db:
                     self.db.execute(f"ALTER TABLE tasks ADD COLUMN {name} {ddl}")
+        if self.db.execute("PRAGMA user_version").fetchone()[0] < 1:
+            # Version 1: chats stopped being linked to a repo and all run in the workspace folder.
+            # Claude sessions are tied to the folder they ran in, so old ones can't be resumed;
+            # their next turn starts a fresh session with a recap of the conversation instead.
+            with self.db:
+                self.db.execute("UPDATE conversations SET repo = NULL, session_id = NULL")
+                self.db.execute("PRAGMA user_version = 1")
 
     # conversations
 

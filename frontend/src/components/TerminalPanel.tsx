@@ -157,7 +157,7 @@ export function TerminalPanel() {
             className={`tab ${t.id === active ? 'active' : ''}`}
             onClick={() => useApp.setState({ activeTerminal: t.id })}
             onMouseDown={(e) => e.button === 1 && (e.preventDefault(), closeTerminal(t.id))}
-            title={t.repo ? `${t.title}${t.task ? ' (task worktree)' : ''}` : 'Scratch folder (no repo)'}
+            title={t.repo ? `${t.title}${t.task ? ' (task worktree)' : ''}` : 'Workspace folder'}
           >
             <SquareTerminal size={13} />
             <span>{t.title}</span>

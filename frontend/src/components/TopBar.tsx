@@ -18,7 +18,6 @@ export function TopBar() {
 
   // Only tasks that still have a worktree can be opened as a workspace.
   const repoTasks = tasks.filter((t) => t.repo === workspace?.repo && t.status !== 'discarded' && t.status !== 'merged')
-  const access = repos.find((r) => r.name === workspace?.repo)?.access
   const [auth, setAuth] = useState<AuthStatus | null>(null)
 
   useEffect(() => {
@@ -53,7 +52,7 @@ export function TopBar() {
           <option key={t.id} value={t.id}>Task: {t.title}</option>
         ))}
       </select>
-      {access && <span className="tag">{workspace?.task ? 'Task worktree' : access === 'write' ? 'Read / write' : 'Read only'}</span>}
+      {workspace?.task && <span className="tag">Task worktree</span>}
       <div className="spacer" />
       <div className="usage" title="Claude plan usage">
         {Object.entries(windows).map(([key, w]) => (

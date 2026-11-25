@@ -42,15 +42,15 @@ and tell them to switch the conversation to Agent mode (toggle above the chat) t
 Be direct and substantive. Push back on weak ideas and say what you would do instead.
 """
 
-CONTEXT_REPO ="This conversation is linked to the repo '{name}' ({access}). Your working directory is its checkout."
-CONTEXT_READ_ONLY = (
-    "The repo is read-only: you and your subagents cannot edit it, and start_task is unavailable. "
-    "If the user wants changes, tell them to set `access: write` for it in config.yaml."
+CONTEXT_WORKSPACE = (
+    "Your working directory is the user's workspace, {root}. Each folder in it is a project: {repos}. "
+    "Work in whichever project the user's message is about; if that is unclear, ask. Before changing a "
+    "project, read its CLAUDE.md or README if it has one. start_task takes the project's name as `repo`."
 )
 CONTEXT_SCRATCH = (
-    "This conversation is not linked to a repo. Your working directory is a scratch folder. "
-    "Delegated repos you can read: {repos}. To change code, ask the user to link the conversation "
-    "to a repo (selector at the top of the chat)."
+    "Your working directory is a scratch folder. The user's projects are: {repos}. "
+    "Work in whichever project the user's message is about; if that is unclear, ask. "
+    "start_task takes the project's name as `repo`."
 )
 
 

@@ -1,10 +1,13 @@
-# Copy to config.yaml (git-ignored) and list the repos the agents may touch.
-# access: read  -> agents can read and run read-only commands; every file edit is blocked
-# access: write -> agents can edit files (they still can't push to main, force-push, or merge)
+# Copy to config.yaml (git-ignored).
+# The folder holding your projects. Every folder in it becomes a project (named after the folder)
+# that agents can read and change; chats run here and can work on any of them. Agents still can't
+# push to main, force-push, or merge.
+workspace: C:/Users/you/code            # or /home/you/code
+
+# Optional: projects outside the workspace, or extra settings for ones inside it.
 repos:
   - name: my-app
-    path: C:/Users/you/code/my-app      # or /home/you/code/my-app
-    access: write
+    path: C:/Users/you/code/my-app
     github: you/my-app                  # optional, owner/repo
     # Optional. Each task gets its own git worktree; node_modules folders from the main checkout are
     # linked into it automatically. `setup` runs extra shell commands in a new worktree (10 min limit

@@ -28,12 +28,15 @@ class TerminalError(Exception):
 
 
 def resolve_cwd(config: Config, store: Store, repo: str | None, task: str | None = None) -> Path:
-    """The shell's working directory: a configured repo or task worktree, or the scratch dir for no repo.
+    """The shell's working directory: a configured repo or task worktree; for no repo, the workspace
+    folder (or the scratch dir without one).
 
     Raises WorkspaceError for an unknown repo or task, TerminalError for a read-only repo: a shell
     could edit anything there, which would break the read-only guarantee.
     """
     if not repo:
+        if config.workspace:
+            return config.workspace
         SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
         return SCRATCH_DIR.resolve()
     ws = get_workspace(config, store, repo, task)

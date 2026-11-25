@@ -8,7 +8,7 @@ import type { FileContent } from '../api'
 import { EDITOR_FONT, monacoTheme } from '../monaco'
 import { useApp } from '../store'
 import { wsKey } from '../types'
-import type { Finding, Tab, WorkspaceRef } from '../types'
+import type { Finding, Tab } from '../types'
 import { FindingRow } from './ChangesPanel'
 import { EventView } from './EventList'
 import { ACTIVE_STATUSES, StatusDot } from './TasksPanel'
@@ -24,11 +24,6 @@ const EDITOR_OPTIONS: editor.IStandaloneEditorConstructionOptions = {
   scrollbar: { verticalScrollbarSize: 10, horizontalScrollbarSize: 10, useShadows: false },
   overviewRulerBorder: false,
   guides: { indentation: true },
-}
-
-function useWritable(ws: WorkspaceRef) {
-  const access = useApp((s) => s.repos.find((r) => r.name === ws.repo)?.access)
-  return !!ws.task || access === 'write'
 }
 
 function TabLabel({ tab, title }: { tab: Tab; title: (id: string) => string }) {
@@ -117,7 +112,6 @@ function FileEditor({ tab }: { tab: Extract<Tab, { kind: 'file' }> }) {
   const isDirty = useApp((s) => !!s.dirtyTabs[tab.id])
   const setDirty = useApp((s) => s.setDirty)
   const showError = useApp((s) => s.showError)
-  const writable = useWritable(tab.ws)
   const [file, setFile] = useState<FileContent | null>(null)
   const [error, setError] = useState<string | null>(null)
   const saved = useRef('')
@@ -165,12 +159,11 @@ function FileEditor({ tab }: { tab: Extract<Tab, { kind: 'file' }> }) {
 
   return (
     <div className="editor-wrap">
-      {!writable && <span className="tag editor-note">Read only</span>}
       <Editor
         path={`${key}/${tab.path}`}
         value={file.content}
         theme={monacoTheme()}
-        options={{ ...EDITOR_OPTIONS, readOnly: !writable }}
+        options={EDITOR_OPTIONS}
         loading={<Loading />}
         onChange={(value) => {
           current.current = value ?? ''

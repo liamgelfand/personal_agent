@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # PERSONAL_AGENT_CONFIG points at another config file (the tests use it when config.yaml is absent).
@@ -19,6 +19,7 @@ WORKTREES_DIR = DATA_DIR / "worktrees"  # one git worktree per agent task
 
 
 class Access(str, Enum):
+    # Internal: Chat mode views every root as READ. Configured repos are always WRITE.
     READ = "read"  # agents may read and run commands, never edit files
     WRITE = "write"  # agents may edit files in the repo
 
@@ -26,7 +27,7 @@ class Access(str, Enum):
 class Repo(BaseModel):
     name: str
     path: Path
-    access: Access = Access.READ
+    access: Access = Access.WRITE
     github: str | None = None  # "owner/repo", used by the GitHub integration later
     # Shell commands run in each new task worktree (after node_modules is linked); failures are logged, not fatal.
     setup: list[str] = Field(default_factory=list)
@@ -74,6 +75,10 @@ class TerminalSettings(BaseModel):
 
 
 class Config(BaseModel):
+    # A folder holding your projects. Every non-hidden folder directly inside it becomes a repo
+    # (named after the folder), and chats run there with access to all of them.
+    workspace: Path | None = None
+    # Extra repos, or settings (github, setup, verify) for ones the workspace already includes.
     repos: list[Repo] = Field(default_factory=list)
     models: Models = Field(default_factory=Models)
     max_turns: int = 60
@@ -89,6 +94,30 @@ class Config(BaseModel):
     # always asks, and hard blocks (force push, push to main, reset --hard) still apply.
     auto_approve: bool = False
     billing: Literal["subscription", "api"] = "subscription"
+
+    @field_validator("workspace")
+    @classmethod
+    def _resolve_workspace(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        path = value.expanduser().resolve()
+        if not path.is_dir():
+            raise ValueError(f"workspace path does not exist: {path}")
+        return path
+
+    @model_validator(mode="after")
+    def _discover(self) -> Config:
+        """Add every project folder in the workspace that repos doesn't already list."""
+        if self.workspace is None:
+            return self
+        listed = {r.path for r in self.repos}
+        names = {r.name for r in self.repos}
+        for child in sorted(self.workspace.iterdir(), key=lambda p: p.name.lower()):
+            if child.is_dir() and not child.name.startswith(".") and child.resolve() not in listed:
+                if child.name not in names:
+                    self.repos.append(Repo(name=child.name, path=child))
+                    names.add(child.name)
+        return self
 
     def repo(self, name: str) -> Repo:
         for repo in self.repos:

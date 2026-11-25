@@ -23,14 +23,13 @@ export function ChatPanel() {
   const [showHistory, setShowHistory] = useState(false)
   const activeConv = useApp((s) => s.activeConv)
   const conv = useApp((s) => (s.activeConv ? s.convCache[s.activeConv] : undefined))
-  const workspace = useApp((s) => s.workspace)
   const newConversation = useApp((s) => s.newConversation)
   const showError = useApp((s) => s.showError)
   const [editingTitle, setEditingTitle] = useState(false)
 
   async function startNew() {
     try {
-      await newConversation(workspace?.repo ?? null)
+      await newConversation()
       setShowHistory(false)
     } catch (e) {
       showError(e)
@@ -89,23 +88,19 @@ export function ChatPanel() {
 
 function History({ onPick }: { onPick: () => void }) {
   const conversations = useApp((s) => s.conversations)
-  const repos = useApp((s) => s.repos)
   const activeConv = useApp((s) => s.activeConv)
   const busy = useApp((s) => s.busyConvs)
   const openConversation = useApp((s) => s.openConversation)
   const refresh = useApp((s) => s.refreshConversations)
   const showError = useApp((s) => s.showError)
   const [query, setQuery] = useState('')
-  const [repoFilter, setRepoFilter] = useState<string>('*')
 
   useEffect(() => {
     const t = setTimeout(() => refresh(query || undefined).catch(showError), 250)
     return () => clearTimeout(t)
   }, [query]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const shown = conversations.filter((c) =>
-    repoFilter === '*' ? true : repoFilter === '' ? c.repo === null : c.repo === repoFilter,
-  )
+  const shown = conversations
 
   async function remove(c: Conversation) {
     if (!confirm(`Delete "${c.title}"?`)) return
@@ -119,13 +114,6 @@ function History({ onPick }: { onPick: () => void }) {
           <Search size={14} />
           <input placeholder="Search chats" value={query} onChange={(e) => setQuery(e.target.value)} autoFocus />
         </div>
-        <select value={repoFilter} onChange={(e) => setRepoFilter(e.target.value)} aria-label="Filter by repo">
-          <option value="*">All repos</option>
-          <option value="">No repo</option>
-          {repos.map((r) => (
-            <option key={r.name} value={r.name}>{r.name}</option>
-          ))}
-        </select>
       </div>
       <div className="history-list">
         {shown.map((c) => (
@@ -140,8 +128,6 @@ function History({ onPick }: { onPick: () => void }) {
             </div>
             <div className="history-meta">
               <span>{c.mode === 'chat' ? 'Chat' : 'Agent'}</span>
-              <span>·</span>
-              <span>{c.repo ?? 'No repo'}</span>
               <span>·</span>
               <span>{ago(c.updated_at)}</span>
               <button className="text-btn danger" onClick={(e) => (e.stopPropagation(), remove(c))}>Delete</button>
@@ -172,18 +158,25 @@ function ConversationView({ id }: { id: string }) {
   }
   const bottom = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLTextAreaElement>(null)
-  // @mentions: the repo's files, and the "@query" being typed at the caret (if any).
-  const [files, setFiles] = useState<string[]>([])
+  // @mentions are workspace paths ("project/path"), independent of what the explorer shows:
+  // "@" first offers projects, then that project's files once "project/" is typed.
   const [mention, setMention] = useState<{ start: number; query: string } | null>(null)
   const [pick, setPick] = useState(0)
-  const repo = conv?.repo ?? null
+  const [projectFiles, setProjectFiles] = useState<Record<string, string[]>>({})
+  const slash = mention?.query.indexOf('/') ?? -1
+  const mentionProject = mention && slash > 0 ? mention.query.slice(0, slash) : null
 
   useEffect(() => {
-    setFiles([])
-    if (repo) api.tree({ repo, task: null }).then((t) => setFiles(t.files), () => setFiles([]))
-  }, [repo])
+    if (!mentionProject || projectFiles[mentionProject] || !repos.some((r) => r.name === mentionProject)) return
+    const done = (files: string[]) => setProjectFiles((f) => ({ ...f, [mentionProject]: files.map((x) => `${mentionProject}/${x}`) }))
+    api.tree({ repo: mentionProject, task: null }).then((t) => done(t.files), () => done([]))
+  }, [mentionProject, projectFiles, repos])
 
-  const suggestions = useMemo(() => (mention ? fuzzyFilter(mention.query, files, 8) : []), [mention, files])
+  const suggestions = useMemo(() => {
+    if (!mention) return []
+    if (!mentionProject) return fuzzyFilter(mention.query, repos.map((r) => `${r.name}/`), 8)
+    return fuzzyFilter(mention.query, projectFiles[mentionProject] ?? [], 8)
+  }, [mention, mentionProject, projectFiles, repos])
   // For each event, which user message it is (the server edits by this number), or -1.
   const userIndex = useMemo(() => {
     let n = 0
@@ -219,18 +212,20 @@ function ConversationView({ id }: { id: string }) {
   function trackMention(el: HTMLTextAreaElement) {
     const before = el.value.slice(0, el.selectionStart)
     const match = /(^|\s)@([\w.\-/]*)$/.exec(before)
-    setMention(match && files.length ? { start: before.length - match[2].length - 1, query: match[2] } : null)
+    setMention(match && repos.length ? { start: before.length - match[2].length - 1, query: match[2] } : null)
     setPick(0)
   }
 
   function insertMention(path: string) {
     if (!mention) return
+    // A project ("name/") keeps the menu open for its files; a file ends the mention with a space.
+    const isProject = path.endsWith('/')
     const end = mention.start + 1 + mention.query.length
-    const next = `${draft.slice(0, mention.start)}@${path} ${draft.slice(end)}`
-    setDraft(next)
-    setMention(null)
+    setDraft(`${draft.slice(0, mention.start)}@${path}${isProject ? '' : ' '}${draft.slice(end)}`)
+    setMention(isProject ? { start: mention.start, query: path } : null)
+    setPick(0)
     requestAnimationFrame(() => {
-      const caret = mention.start + path.length + 2
+      const caret = mention.start + path.length + (isProject ? 1 : 2)
       input.current?.focus()
       input.current?.setSelectionRange(caret, caret)
     })
@@ -240,14 +235,6 @@ function ConversationView({ id }: { id: string }) {
     if (mode === conv!.mode) return
     try {
       await api.updateConversation(id, { mode })
-    } catch (e) {
-      showError(e)
-    }
-  }
-
-  async function link(value: string) {
-    try {
-      await api.updateConversation(id, value ? { repo: value } : { unlink: true })
     } catch (e) {
       showError(e)
     }
@@ -271,23 +258,13 @@ function ConversationView({ id }: { id: string }) {
             </button>
           ))}
         </div>
-        <select value={conv.repo ?? ''} disabled={busy} onChange={(e) => link(e.target.value)} aria-label="Linked repo">
-          <option value="">No repo</option>
-          {repos.map((r) => (
-            <option key={r.name} value={r.name}>
-              {r.name} ({r.access === 'write' ? 'read / write' : 'read only'})
-            </option>
-          ))}
-        </select>
       </div>
       <div className="transcript no-scrollbar">
         {(events ?? []).length === 0 && !busy && (
           <p className="empty">
             {conv.mode === 'chat'
-              ? `Chat mode: discuss ideas${conv.repo ? ` and ${conv.repo}'s code` : ''}. Nothing on your machine is changed. Switch to Agent to make changes.`
-              : conv.repo
-                ? `Agent mode: ask about ${conv.repo} or describe a change. Larger changes run as tasks you review before committing.`
-                : 'Agent mode with no repo. Link a repo above to work on code.'}
+              ? 'Chat mode: discuss ideas and any of your projects. Nothing on your machine is changed. Switch to Agent to make changes.'
+              : 'Agent mode: ask about any of your projects or describe a change. Larger changes run as tasks you review before committing.'}
           </p>
         )}
         {transcript}
@@ -314,7 +291,7 @@ function ConversationView({ id }: { id: string }) {
           {suggestions.length > 0 && (
             <div className="mention-menu" role="listbox" aria-label="Mention a file">
               {suggestions.map((path, i) => {
-                const slash = path.lastIndexOf('/')
+                const slash = path.endsWith('/') ? -1 : path.lastIndexOf('/')
                 return (
                   <div
                     key={path}
@@ -357,8 +334,8 @@ function ConversationView({ id }: { id: string }) {
           />
           <div className="composer-foot">
             <span className="faint small">
-              {conv.mode === 'chat' ? 'Chat mode, read only' : 'Agent mode'}
-              {conv.repo ? ' · @ to mention a file' : ''}
+              {conv.mode === 'chat' ? 'Chat mode' : 'Agent mode'}
+              {repos.length ? ' · @ to mention a file' : ''}
             </span>
             <div className="spacer" />
             {busy ? (

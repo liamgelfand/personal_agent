@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import uuid
 from contextlib import aclosing
@@ -14,7 +15,7 @@ from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server, get_sess
 
 from .agents import (
     NO_ATTRIBUTION,
-    CHAT_MODE_PROMPT, CONTEXT_READ_ONLY, CONTEXT_REPO, CONTEXT_SCRATCH, ORCHESTRATOR_PROMPT, chat_subagents,
+    CHAT_MODE_PROMPT, CONTEXT_SCRATCH, CONTEXT_WORKSPACE, ORCHESTRATOR_PROMPT, chat_subagents,
 )
 from .bus import Bus
 from .checkpoints import Checkpoint, CheckpointError, Checkpoints
@@ -35,6 +36,10 @@ MENTION_FILE_LIMIT = 100_000
 MENTION_TOTAL_LIMIT = 300_000
 DEFAULT_TITLE = "New chat"
 TITLE_PROMPT = "Write a 3-6 word title for this conversation. Reply with the title only, no quotes.\n\n{text}"
+TITLE_PROJECTS = (
+    "\n\nThe assistant worked in these projects: {projects}. Start the title with the project name "
+    "(shortened if long, e.g. 'Geospatial') and a colon; for several projects, name the main one."
+)
 # Claude Code refuses a truncating resume whose discarded range holds more than the dropped turn.
 FORK_REJECTED = "Resume rejected by --resume-drops-turn:"
 
@@ -65,6 +70,24 @@ def _is_prompt(message: Any) -> bool:
     content = (message.message or {}).get("content")
     return not (isinstance(content, list) and content
                 and all(isinstance(b, dict) and b.get("type") == "tool_result" for b in content))
+
+
+def touched_projects(events: list[dict[str, Any]], repos: list[Repo]) -> list[str]:
+    """Projects the agent's tool calls named (a path in them, or the project folder in a command),
+    in order of first use. Only used to title the chat; it never limits what the chat can do."""
+    found: list[str] = []
+    for e in events:
+        if e["type"] != "tool" or not e.get("summary"):
+            continue
+        text = e["summary"].replace("\\", "/").lower()
+        for repo in repos:
+            if repo.name in found:
+                continue
+            path = repo.path.as_posix().lower()
+            name = re.escape(repo.name.lower())
+            if path in text or re.search(rf"(^|[\s\"'=:/]){name}(/|$|[\s\"'])", text):
+                found.append(repo.name)
+    return found
 
 
 def attach_mentions(prompt: str, root: Path | None) -> str:
@@ -116,8 +139,9 @@ class ChatManager:
         return False
 
     def checkpoint_roots(self) -> list[Path]:
-        """Where undoing a turn may write: every delegated repo plus the scratch folder."""
-        return [r.path for r in self.config.repos] + [SCRATCH_DIR.resolve()]
+        """Where undoing a turn may write: the workspace, every delegated repo, and the scratch folder."""
+        workspace = [self.config.workspace] if self.config.workspace else []
+        return workspace + [r.path for r in self.config.repos] + [SCRATCH_DIR.resolve()]
 
     def edit(self, conv_id: str, index: int, text: str) -> None:
         """Rewind to just before the index-th user message, then send text in its place.
@@ -138,11 +162,7 @@ class ChatManager:
         row_id, edited = users[index]
         # Everything that can fail comes before the first file is touched, so a refused edit
         # leaves files, checkpoints and history as they were.
-        try:
-            cwd = self._cwd(conv)
-        except KeyError as exc:
-            raise ValueError(f"the conversation's repo is no longer configured ({exc})") from exc
-        fork = self._fork_point(edited, cwd)
+        fork = self._fork_point(edited, self._cwd())
         dropped = [e for i, e in rows if i >= row_id]
         warnings = self._undo([e["id"] for e in dropped if e["type"] == "checkpoint"])
         self.store.delete_events_from(conv_id, row_id)
@@ -182,7 +202,7 @@ class ChatManager:
             messages = []
         uuids = [m.uuid for m in messages]
         if prompt_uuid not in uuids:
-            return None  # transcript gone, or in another repo's project (the repo changed since)
+            return None  # transcript gone, or from before chats moved to the workspace folder
         i = uuids.index(prompt_uuid)
         if i == 0:
             return None  # the message started its session: nothing earlier to keep
@@ -198,43 +218,50 @@ class ChatManager:
         await self.bus.publish({**event, "conversation_id": conv_id})
         return event_id
 
-    def _workspace_server(self, conv_id: str, repo: Repo):
+    def _workspace_server(self, conv_id: str):
         @tool(
             "start_task",
-            "Start an implementation task: the implementer agent works in an isolated git worktree, "
-            "then the reviewer checks it and the implementer fixes blocking findings. Returns immediately; "
-            "the task runs in the background and the user reviews the diff in the IDE.",
-            {"title": str, "spec": str},
+            "Start an implementation task in one project: the implementer agent works in an isolated git "
+            "worktree, then the reviewer checks it and the implementer fixes blocking findings. Returns "
+            "immediately; the task runs in the background and the user reviews the diff in the IDE. "
+            "`repo` is the project's name (its folder name).",
+            {"repo": str, "title": str, "spec": str},
         )
         async def start_task(args: dict[str, Any]) -> dict[str, Any]:
-            task = await self.tasks.create(repo.name, args["title"], args["spec"], conv_id)
+            try:
+                self.config.repo(args["repo"])
+            except KeyError:
+                names = ", ".join(r.name for r in self.config.repos)
+                return {"content": [{"type": "text", "text": f"Unknown repo '{args['repo']}'. Projects: {names}"}],
+                        "is_error": True}
+            task = await self.tasks.create(args["repo"], args["title"], args["spec"], conv_id)
             await self._emit(conv_id, {"type": "task_link", "task_id": task["id"], "title": task["title"]})
             return {"content": [{"type": "text", "text": f"Started task {task['id']} on branch {task['branch']}."}]}
 
-        @tool("list_tasks", "List agent tasks for this repo with their status.", {})
+        @tool("list_tasks", "List agent tasks with their status. `repo` limits it to one project; empty lists all.",
+              {"repo": str})
         async def list_tasks(args: dict[str, Any]) -> dict[str, Any]:
-            rows = [f"{t['id']} [{t['status']}] {t['title']} ({t['branch']})" for t in self.store.tasks(repo.name)]
+            rows = [f"{t['id']} [{t['status']}] {t['repo']}: {t['title']} ({t['branch']})"
+                    for t in self.store.tasks(args.get("repo") or None)]
             return {"content": [{"type": "text", "text": "\n".join(rows) or "No tasks."}]}
 
         return create_sdk_mcp_server("workspace", tools=[start_task, list_tasks])
 
-    def _cwd(self, conv: dict[str, Any]) -> Path:
-        return self.config.repo(conv["repo"]).path if conv["repo"] else SCRATCH_DIR
+    def _cwd(self) -> Path:
+        """Every conversation runs in the workspace folder (or the scratch folder without one)."""
+        return self.config.workspace or SCRATCH_DIR
 
     def _options(
         self, conv: dict[str, Any], checkpoint: Checkpoint | None = None, fork: dict[str, str] | None = None
     ) -> ClaudeAgentOptions:
         conv_id = conv["id"]
-        repo = self.config.repo(conv["repo"]) if conv["repo"] else None
-        if repo:
-            cwd = repo.path
-            context = CONTEXT_REPO.format(name=repo.name, access=repo.access.value)
-            if repo.access is not Access.WRITE:
-                context += "\n" + CONTEXT_READ_ONLY
-            roots = list(self.config.repos)
+        cwd = self._cwd()
+        names = ", ".join(r.name for r in self.config.repos) or "none"
+        if self.config.workspace:
+            context = CONTEXT_WORKSPACE.format(root=cwd, repos=names)
+            roots = [Repo(name="workspace", path=cwd, access=Access.WRITE), *self.config.repos]
         else:
-            cwd = SCRATCH_DIR
-            context = CONTEXT_SCRATCH.format(repos=", ".join(r.name for r in self.config.repos) or "none")
+            context = CONTEXT_SCRATCH.format(repos=names)
             roots = [*self.config.repos, Repo(name="scratch", path=SCRATCH_DIR, access=Access.WRITE)]
 
         async def approve(tool_name: str, args: dict[str, Any], reason: str) -> bool:
@@ -244,7 +271,7 @@ class ChatManager:
 
         common = dict(
             cwd=cwd,
-            add_dirs=[r.path for r in self.config.repos if r.path != cwd],
+            add_dirs=[r.path for r in self.config.repos if r.path != cwd and cwd not in r.path.parents],
             setting_sources=["project"],
             settings=NO_ATTRIBUTION,
             model=self.config.models.orchestrator,
@@ -268,7 +295,7 @@ class ChatManager:
                 hooks={"PreToolUse": [guard_hook(read_only_roots, cwd, approve, self.config.auto_approve)]},
             )
 
-        can_start_tasks = repo is not None and repo.access is Access.WRITE
+        can_start_tasks = bool(self.config.repos)
         hooks = {"PreToolUse": [guard_hook(roots, cwd, approve, self.config.auto_approve)]}
         if checkpoint:
             for event, matchers in checkpoint.hooks().items():
@@ -279,7 +306,7 @@ class ChatManager:
             agents=chat_subagents(self.config.models),
             allowed_tools=BASE_TOOLS + (TASK_TOOLS if can_start_tasks else []),
             disallowed_tools=["PowerShell"],
-            mcp_servers={"workspace": self._workspace_server(conv_id, repo)} if can_start_tasks else {},
+            mcp_servers={"workspace": self._workspace_server(conv_id)} if can_start_tasks else {},
             hooks=hooks,
         )
 
@@ -307,9 +334,10 @@ class ChatManager:
                 conv = self.store.update_conversation(conv_id, title=first_line or DEFAULT_TITLE)
                 await self.bus.publish({"type": "conversation_updated", "conversation": conv})
 
-            mentioned = attach_mentions(prompt, self._cwd(conv) if conv["repo"] else None)
+            # Mentions are workspace-relative (@project/path); without a workspace they can't resolve.
+            mentioned = attach_mentions(prompt, self.config.workspace)
             # Agent mode records the original of every file it edits, so the turn can be undone.
-            checkpoint = Checkpoint(self._cwd(conv)) if conv["mode"] == "agent" else None
+            checkpoint = Checkpoint(self._cwd()) if conv["mode"] == "agent" else None
             while True:
                 agent_prompt = mentioned
                 if not fork and not conv["session_id"] and history:
@@ -336,8 +364,25 @@ class ChatManager:
                 await self._emit(conv_id, {"type": "checkpoint", **saved})
             self.running.pop(conv_id, None)
             await self.bus.publish({"type": "chat_status", "conversation_id": conv_id, "busy": False})
-        if not history:
-            asyncio.create_task(self._generate_title(conv_id, prompt))
+        self._retitle(conv_id, first_turn=not history)
+
+    def _retitle(self, conv_id: str, first_turn: bool) -> None:
+        """Title the chat after its first turn, and again whenever it starts working in another
+        project, so the title names the projects it touched. A title the user set is never replaced."""
+        conv = self.store.conversation(conv_id)
+        if not conv:
+            return
+        events = self.store.events(conversation_id=conv_id)
+        projects = touched_projects(events, self.config.repos)
+        task_repos = [t["repo"] for t in reversed(self.store.tasks()) if t["conversation_id"] == conv_id]
+        projects += [r for r in dict.fromkeys(task_repos) if r not in projects]
+        known = json.loads(conv.get("projects") or "[]")
+        if projects != known:
+            self.store.update_conversation(conv_id, projects=json.dumps(projects))
+        if conv["title_locked"] or not (first_turn or set(projects) - set(known)):
+            return
+        first = next((e["text"] for e in events if e["type"] == "user"), "")
+        asyncio.create_task(self._generate_title(conv_id, first, projects))
 
     async def _run(
         self, conv_id: str, options: ClaudeAgentOptions, prompt: str, user: dict[str, Any], fork: dict[str, str] | None
@@ -369,15 +414,20 @@ class ChatManager:
             raise
         return False
 
-    async def _generate_title(self, conv_id: str, prompt: str) -> None:
+    async def _generate_title(self, conv_id: str, prompt: str, projects: list[str] | None = None) -> None:
         options = ClaudeAgentOptions(
             model="haiku", system_prompt="You write concise conversation titles.",
             tools=[], max_turns=1, setting_sources=[],
         )
+        text = TITLE_PROMPT.format(text=prompt[:2000])
+        if projects:
+            text += TITLE_PROJECTS.format(projects=", ".join(projects))
         try:
-            async for event in run_agent(options, TITLE_PROMPT.format(text=prompt[:2000]), self.store, self.bus, "title", conv_id):
+            async for event in run_agent(options, text, self.store, self.bus, "title", conv_id):
                 if event["type"] == "result" and event["result"] and not event["is_error"]:
                     title = event["result"].strip().splitlines()[0].strip("\"'*#_` ")[:80]
+                    if (self.store.conversation(conv_id) or {}).get("title_locked"):
+                        return  # renamed by the user while the title was being written
                     conv = self.store.update_conversation(conv_id, title=title)
                     await self.bus.publish({"type": "conversation_updated", "conversation": conv})
         except Exception:

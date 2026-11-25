@@ -1,4 +1,5 @@
 import asyncio
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,7 +8,7 @@ import pytest
 
 from personal_agent import gitops
 from personal_agent.admin import classify
-from personal_agent.chat import attach_mentions
+from personal_agent.chat import attach_mentions, touched_projects
 from personal_agent.checkpoints import Checkpoint, CheckpointError, Checkpoints
 from personal_agent.config import PROJECT_ROOT, Access, Repo
 from personal_agent.store import Store
@@ -582,9 +583,9 @@ def chat(tmp_path, repo, monkeypatch):
     agent = FakeAgent()
     monkeypatch.setattr(chat_module, "run_agent", agent)
     store = Store(tmp_path / "t.db")
-    config = Config(repos=[Repo(name="r", path=repo, access=Access.WRITE)])
+    config = Config(workspace=tmp_path, repos=[Repo(name="r", path=repo)])
     manager = chat_module.ChatManager(config, store, Bus(), None, Checkpoints(store))
-    return manager, store, agent, store.create_conversation("r", "agent")["id"]
+    return manager, store, agent, store.create_conversation(None, "agent")["id"]
 
 
 def transcript_entry(u: str) -> SimpleNamespace:
@@ -819,20 +820,6 @@ async def test_edit_rejects_busy_conversation(chat, monkeypatch):
         assert exc.value.status_code == 400
     assert transcript(store, conv_id) == [("user", "first"), ("text", "reply 1")]  # nothing was removed
     assert store.conversation(conv_id)["session_id"] == "s1"
-
-
-async def test_refused_edit_touches_nothing(chat, repo):
-    manager, store, agent, conv_id = chat
-    agent.writes = {1: (repo / "app.py", "one\n")}
-    await say(manager, conv_id, "change it")
-    before = store.events(conversation_id=conv_id)
-    store.update_conversation(conv_id, repo="gone")  # the repo was removed from config.yaml since
-    with pytest.raises(ValueError, match="no longer configured"):
-        manager.edit(conv_id, 0, "never mind")
-    assert (repo / "app.py").read_text() == "one\n"  # not restored
-    assert manager.checkpoints.restored_ids([e["id"] for e in before if e["type"] == "checkpoint"]) == set()
-    assert store.events(conversation_id=conv_id) == before and store.conversation(conv_id)["session_id"] == "s1"
-    assert conv_id not in manager.running
 
 
 async def test_edit_undoes_discarded_turns_newest_first(chat, repo):
@@ -1165,3 +1152,142 @@ async def test_admin_exit_ends_task_pipelines_first(monkeypatch, endpoint):
         assert order == ["pipeline ended", "exit scheduled"]
     finally:
         server.tasks.shutting_down = False
+
+
+# workspace: every project folder, no per-chat repo
+
+
+def test_workspace_discovers_project_folders(tmp_path):
+    from personal_agent.config import Config
+
+    for name in ("beta", "alpha", ".hidden"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "notes.txt").write_text("not a project")
+    extra = tmp_path / "elsewhere"
+    extra.mkdir()
+    config = Config(workspace=tmp_path, repos=[
+        Repo(name="alpha-custom", path=tmp_path / "alpha", github="me/alpha"),  # settings for a workspace folder
+        Repo(name="other", path=extra),
+    ])
+    assert [r.name for r in config.repos] == ["alpha-custom", "other", "beta"]  # alpha and elsewhere not doubled
+    assert config.repo("alpha-custom").github == "me/alpha"
+    assert all(r.access is Access.WRITE for r in config.repos)
+
+
+def test_workspace_must_exist(tmp_path):
+    from pydantic import ValidationError
+
+    from personal_agent.config import Config
+
+    with pytest.raises(ValidationError, match="workspace path does not exist"):
+        Config(workspace=tmp_path / "missing")
+
+
+def test_old_conversations_are_unlinked_once(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "t.db"
+    store = Store(path)
+    conv = store.create_conversation(None, "agent")["id"]
+    with store.db:
+        store.db.execute("PRAGMA user_version = 0")  # as before the migration existed
+        store.db.execute("UPDATE conversations SET repo = 'r', session_id = 's1'")
+    store.db.close()
+    store = Store(path)
+    assert {k: store.conversation(conv)[k] for k in ("repo", "session_id")} == {"repo": None, "session_id": None}
+    store.update_conversation(conv, session_id="s2")
+    store.db.close()
+    assert Store(path).conversation(conv)["session_id"] == "s2"  # runs once, not on every start
+    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+async def test_chats_run_in_the_workspace_with_every_project(chat, tmp_path, repo):
+    manager, store, agent, conv_id = chat
+    await say(manager, conv_id, "hello")
+    options = agent.calls[0][0]
+    assert Path(options.cwd) == tmp_path.resolve()
+    assert options.add_dirs == []  # every repo is inside the workspace
+    assert "mcp__workspace__start_task" in options.allowed_tools and "workspace" in options.mcp_servers
+    assert "Each folder in it is a project: " in options.system_prompt["append"]
+    assert "r" in options.system_prompt["append"].split("project: ", 1)[1]
+
+
+async def test_start_task_takes_the_repo_by_name(chat):
+    manager, store, agent, conv_id = chat
+    created = []
+
+    class Tasks:
+        async def create(self, repo, title, spec, conversation_id):
+            created.append(repo)
+            return {"id": "t1", "title": title, "branch": "agent/x"}
+
+    manager.tasks = Tasks()
+    start = next(t for t in _sdk_tools(manager, conv_id) if t.name == "start_task")
+    bad = await start.handler({"repo": "nope", "title": "x", "spec": "y"})
+    assert bad.get("is_error") and "Unknown repo 'nope'" in bad["content"][0]["text"] and created == []
+    good = await start.handler({"repo": "r", "title": "Add x", "spec": "y"})
+    assert "Started task t1" in good["content"][0]["text"] and created == ["r"]
+
+
+def _sdk_tools(manager, conv_id):
+    """The SdkMcpTool objects _workspace_server registers, captured from create_sdk_mcp_server."""
+    from personal_agent import chat as chat_module
+
+    captured = []
+    original = chat_module.create_sdk_mcp_server
+    chat_module.create_sdk_mcp_server = lambda name, tools: captured.extend(tools) or {}
+    try:
+        manager._workspace_server(conv_id)
+    finally:
+        chat_module.create_sdk_mcp_server = original
+    return captured
+
+
+def test_touched_projects_reads_paths_and_commands(tmp_path):
+    alpha, beta, ml = (tmp_path / n for n in ("alpha", "beta", "ML"))
+    for d in (alpha, beta, ml):
+        d.mkdir()
+    repos = [Repo(name="alpha", path=alpha), Repo(name="beta", path=beta), Repo(name="ML", path=ml)]
+    events = [
+        {"type": "text", "text": "about beta"},  # text is not work in a project
+        {"type": "tool", "name": "Read", "summary": str(beta / "README.md")},
+        {"type": "tool", "name": "Bash", "summary": "cd alpha && npm test"},
+        {"type": "tool", "name": "Bash", "summary": "grep -r html src"},  # "ml" inside a word
+        {"type": "tool", "name": "Read", "summary": str(alpha / "x.py")},
+    ]
+    assert touched_projects(events, repos) == ["beta", "alpha"]
+
+
+async def test_chat_is_retitled_when_it_starts_working_in_a_project(chat, repo):
+    manager, store, agent, conv_id = chat
+    titles = []
+
+    async def fake_title(cid, prompt, projects=None):
+        titles.append((prompt, projects))
+
+    manager._generate_title = fake_title
+    await say(manager, conv_id, "hi there")
+    assert titles == [("hi there", [])]  # first turn: titled, no projects yet
+
+    store.add_event({"type": "tool", "name": "Read", "summary": str(repo / "app.py")}, conversation_id=conv_id)
+    await say(manager, conv_id, "now look at the app")
+    assert titles[-1] == ("hi there", ["r"])
+    assert json.loads(store.conversation(conv_id)["projects"]) == ["r"]
+
+    await say(manager, conv_id, "again")
+    assert len(titles) == 2  # same projects: no new title
+
+    store.update_conversation(conv_id, title="Mine", title_locked=1)
+    store.add_event({"type": "tool", "name": "Bash", "summary": f"ls {repo.parent / 'other'}"}, conversation_id=conv_id)
+    await say(manager, conv_id, "more")
+    assert len(titles) == 2 and store.conversation(conv_id)["title"] == "Mine"
+
+
+def test_renaming_a_chat_locks_its_title(tmp_path, monkeypatch):
+    from personal_agent import server
+
+    store = Store(tmp_path / "t.db")
+    monkeypatch.setattr(server, "store", store)
+    conv = store.create_conversation(None)
+    asyncio.run(server.patch_conversation(conv["id"], server.ConversationPatch(title="My name")))
+    assert store.conversation(conv["id"])["title_locked"] == 1
