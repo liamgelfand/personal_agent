@@ -2,7 +2,7 @@
 
 export type Access = 'read' | 'write'
 
-export type Repo = { name: string; path: string; access: Access; github: string | null }
+export type Repo = { name: string; path: string; github: string | null }
 
 export type Mode = 'agent' | 'chat'
 

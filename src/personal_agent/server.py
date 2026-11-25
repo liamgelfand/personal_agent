@@ -215,7 +215,7 @@ async def test_notification() -> dict:
 
 @app.get("/api/repos")
 def list_repos() -> list[dict]:
-    return [{"name": r.name, "path": str(r.path), "access": r.access.value, "github": r.github} for r in config.repos]
+    return [{"name": r.name, "path": str(r.path), "github": r.github} for r in config.repos]
 
 
 @app.get("/api/auth")
@@ -301,7 +301,6 @@ Mode = Literal["agent", "chat"]
 
 
 class NewConversation(BaseModel):
-    repo: str | None = None
     mode: Mode = "agent"
 
 
@@ -312,29 +311,19 @@ class EditMessage(BaseModel):
 
 class ConversationPatch(BaseModel):
     title: str | None = None
-    repo: str | None = None
-    unlink: bool = False
     mode: Mode | None = None
 
 
-def _check_repo(name: str | None) -> None:
-    if name is not None:
-        try:
-            config.repo(name)
-        except KeyError as exc:
-            raise HTTPException(400, str(exc)) from exc
-
-
 @app.get("/api/conversations")
-def list_conversations(repo: str | None = None, q: str | None = None) -> list[dict]:
+def list_conversations(q: str | None = None) -> list[dict]:
     busy = set(chats.busy())
-    return [{**c, "busy": c["id"] in busy} for c in store.conversations(repo, q)]
+    return [{**c, "busy": c["id"] in busy} for c in store.conversations(query=q)]
 
 
 @app.post("/api/conversations")
 def create_conversation(body: NewConversation) -> dict:
-    _check_repo(body.repo)
-    return store.create_conversation(body.repo, body.mode)
+    # Conversations aren't linked to a repo: every chat can work across the whole workspace.
+    return store.create_conversation(None, body.mode)
 
 
 @app.get("/api/conversations/{conv_id}")
@@ -354,19 +343,11 @@ async def patch_conversation(conv_id: str, body: ConversationPatch) -> dict:
     conv = store.conversation(conv_id) or _not_found("conversation")
     fields = {}
     if body.title:
-        fields["title"] = body.title[:120]
+        fields |= {"title": body.title[:120], "title_locked": 1}  # automatic titles stop replacing it
     if body.mode and body.mode != conv["mode"]:
         if conv_id in chats.busy():
             raise HTTPException(409, "wait for the current turn to finish before switching modes")
         fields["mode"] = body.mode
-    new_repo = None if body.unlink else body.repo
-    if body.unlink or (body.repo is not None and body.repo != conv["repo"]):
-        if conv_id in chats.busy():
-            raise HTTPException(409, "wait for the current turn to finish before changing the repo")
-        _check_repo(new_repo)
-        # Claude sessions are tied to their working directory, so a repo change starts a new
-        # session; the next turn gets a recap of the conversation instead.
-        fields |= {"repo": new_repo, "session_id": None}
     conv = store.update_conversation(conv_id, **fields)
     await bus.publish({"type": "conversation_updated", "conversation": conv})
     return conv

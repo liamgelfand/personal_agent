@@ -40,8 +40,8 @@ export const api = {
     request<Conversation[]>('GET', `/api/conversations${q ? `?q=${encodeURIComponent(q)}` : ''}`),
   conversation: (id: string) =>
     request<Conversation & { events: AgentEvent[] }>('GET', `/api/conversations/${id}`),
-  createConversation: (repo: string | null, mode: Mode) => request<Conversation>('POST', '/api/conversations', { repo, mode }),
-  updateConversation: (id: string, patch: { title?: string; repo?: string; unlink?: boolean; mode?: Mode }) =>
+  createConversation: (mode: Mode) => request<Conversation>('POST', '/api/conversations', { mode }),
+  updateConversation: (id: string, patch: { title?: string; mode?: Mode }) =>
     request<Conversation>('PATCH', `/api/conversations/${id}`, patch),
   deleteConversation: (id: string) => request('DELETE', `/api/conversations/${id}`),
   editMessage: (id: string, index: number, text: string) =>

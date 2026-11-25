@@ -48,14 +48,12 @@ function loadTerminalDock(): { open: boolean; height: number } {
   }
 }
 
-// A shell's folder, decided when it opens: the open chat's repo (scratch if the chat has none), or the
-// IDE workspace when no chat is open. A chat on the workspace's repo uses the workspace, so a task
-// worktree selected in the top bar gets the terminal. The server resolves the actual path.
+// A shell's folder, decided when it opens: the project (and task worktree) selected in the top bar,
+// or the workspace folder when none is. The server resolves the actual path.
 function terminalTarget(s: State): Omit<TerminalRef, 'id'> {
-  const conv = s.activeConv ? s.convCache[s.activeConv] : undefined
-  const { repo, task } = conv && conv.repo !== s.workspace?.repo ? { repo: conv.repo, task: null } : (s.workspace ?? { repo: null, task: null })
+  const { repo, task } = s.workspace ?? { repo: null, task: null }
   const taskTitle = task ? s.tasks.find((t) => t.id === task)?.title : undefined
-  return { repo, task, title: repo ? (task ? `${repo}: ${taskTitle ?? 'task'}` : repo) : 'scratch' }
+  return { repo, task, title: repo ? (task ? `${repo}: ${taskTitle ?? 'task'}` : repo) : 'workspace' }
 }
 
 let terminalSeq = 0
@@ -148,7 +146,7 @@ type State = {
   openConversation: (id: string, refetch?: boolean) => Promise<void>
   closeChatTab: (id: string) => Promise<void>
   cycleChatTab: (step: number) => Promise<void>
-  newConversation: (repo: string | null, mode?: Mode) => Promise<void>
+  newConversation: (mode?: Mode) => Promise<void>
   refreshConversations: (q?: string) => Promise<void>
   refreshTasks: () => Promise<void>
   dismissTask: (id: string) => void
@@ -254,9 +252,9 @@ export const useApp = create<State>((set, get) => ({
     }))
   },
 
-  async newConversation(repo, mode = 'agent') {
+  async newConversation(mode = 'agent') {
     const previous = get().activeConv
-    const conv = await api.createConversation(repo, mode)
+    const conv = await api.createConversation(mode)
     loadedConvs.add(conv.id)
     discardIfBlank(previous)
     set((s) => ({

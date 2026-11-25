@@ -62,11 +62,13 @@ http://127.0.0.1:5173.
 
 - **Project and workspace** (top bar): pick a repo, then its main checkout or one of its task
   worktrees. Files, Search, Changes, and the editor follow the selected workspace.
-- **Chats** are independent of the IDE selection. Link each one to a repo or to none. History
-  lists past chats with search and a repo filter.
+- **Chats** are general and independent of the project open on the left: each runs in the workspace
+  folder and can work on any of your projects, which the agent works out from your message. A chat
+  is titled after its first reply, and retitled with the project name once it works in a project
+  (unless you renamed it). History lists past chats with search.
 - **Modes**: **Chat** mode reads and discusses only (no file edits, no shell, no tasks).
   **Agent** mode can edit files, run commands, and start tasks.
-- **@mentions**: type `@` in the message box to attach a file's contents.
+- **@mentions**: type `@`, pick a project, then a file, to attach its contents.
 - **Undo**: every Agent-mode turn that edited files can be undone from the transcript.
 - **Quick open and search**: `Ctrl+P` jumps to a file; `Ctrl+Shift+F` searches the repo.
 - **Changes**: side-by-side diffs, stage, unstage, discard, commit, and "Request review".
@@ -75,17 +77,17 @@ http://127.0.0.1:5173.
 - **Approvals**: commits, pushes, package installs, and similar commands pause the agent until
   you allow or deny them.
 - **Terminal**: ``Ctrl+` `` or the terminal button in the top bar opens a docked shell under the
-  editor, with tabs for up to 8 terminals and a draggable height. A new terminal starts in the open
-  chat's repo (in the selected task worktree if the top bar shows one of that repo's), in
-  `data/scratch` for a chat with no repo, or in the selected workspace when no chat is open.
+  editor, with tabs for up to 8 terminals and a draggable height. A new terminal starts in the
+  project selected in the top bar (in its task worktree if one is selected).
   Terminals keep running while the dock is hidden. The shell is PowerShell on Windows (`pwsh` if
   installed) and `$SHELL` or `/bin/bash` elsewhere; set `terminal.shell` to change it. See
   [Terminal security](#terminal-security).
 
 ## Configuration
 
-See `config.example.yaml` for every option: repos and access levels, models per role, billing,
-remote access, and notifications.
+See `config.example.yaml` for every option: the workspace and repos, models per role, billing,
+remote access, and notifications. Set `workspace` to the folder holding your projects: every
+folder in it becomes a project the agents can read and change, with no per-repo access levels.
 
 ### Billing
 
@@ -93,17 +95,11 @@ remote access, and notifications.
 from the server's environment at startup, so agent runs always use your claude.ai plan login.
 The top bar shows which account is in use. Set `billing: api` to use an API key instead.
 
-### Repo access
+### Guard
 
-A guard runs before every tool call:
-
-| | `access: read` | `access: write` | task worktree |
-|---|---|---|---|
-| Read / search files | yes | yes | yes |
-| Edit / write files (agent or you) | blocked | yes | yes |
-| Bash | read-only commands only | yes, except the blocklist | yes, except the blocklist |
-| Start tasks | no | yes | n/a |
-| Files outside delegated repos | blocked | blocked | blocked |
+A guard runs before every tool call. In Agent mode, agents can read and edit files, run Bash, and
+start tasks in every project. Chat mode is read-only everywhere. Files outside the workspace and
+the listed repos are blocked.
 
 Always blocked: force-push, pushing to main/master, `git reset --hard`, `git clean -f`,
 `gh repo delete`, and the PowerShell tool. Always needs approval: merging a PR.
@@ -115,10 +111,9 @@ guardrail, not a sandbox. Only delegate repos you are comfortable with an agent 
 ### Terminal security
 
 The terminal is a real shell running as your user, so no guard applies to it. The server decides
-where it starts, from `config.yaml` repos, task worktrees, or the scratch folder; it never takes a
+where it starts, from `config.yaml` repos, task worktrees, or the workspace folder; it never takes a
 path from the browser. It is refused:
 
-- for repos with `access: read`, since a shell could edit them;
 - to web pages this server didn't serve (the same Origin and loopback-Host checks as the live-events
   socket, which also block DNS rebinding) and, with remote access on, to devices that haven't signed in;
 - to every device other than this computer, signed-in phones included, unless you set
@@ -141,7 +136,7 @@ text is sent, never code.
 
 ### Letting agents improve this app
 
-Add this project's own folder to `config.yaml` with `access: write` to let agents work on it.
+Agents can work on this project when it is in the workspace (or listed under `repos`).
 Edits to its `config.yaml`, `.env`, and `src/personal_agent/guards.py` always need your
 approval, so an agent cannot widen its own access unnoticed. When its source changes, a banner
 offers to rebuild the UI and restart the server.
